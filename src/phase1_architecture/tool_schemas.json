@@ -1,0 +1,183 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "create_account",
+      "description": "Creates a new account in the double-entry ledger chart of accounts.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "Unique identifier for the account (e.g., 'ACC_ASSET_VAULT_USD', 'ACC_WALLET_ALICE', 'ACC_REV_FEES')."
+          },
+          "owner_name": {
+            "type": "string",
+            "description": "Full legal name or entity name of the account holder."
+          },
+          "account_type": {
+            "type": "string",
+            "enum": ["ASSET", "LIABILITY", "EQUITY", "REVENUE", "EXPENSE"],
+            "description": "Classification in the fundamental accounting equation (Assets = Liabilities + Equity + Revenue - Expense)."
+          },
+          "currency": {
+            "type": "string",
+            "enum": ["USD", "EUR", "GBP", "INR"],
+            "description": "ISO 4217 currency code for the account."
+          },
+          "kyc_tier": {
+            "type": "string",
+            "enum": ["UNVERIFIED", "SANCTIONED", "PEP_FLAGGED", "TIER_1_BASIC", "TIER_2_FULL", "INSTITUTIONAL"],
+            "description": "Current KYC/AML verification status of the account owner."
+          }
+        },
+        "required": ["account_id", "owner_name", "account_type", "currency", "kyc_tier"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "get_account_balance",
+      "description": "Retrieves the current settled balance, normal balance side (DEBIT or CREDIT), and KYC status of a ledger account prior to staging or validating a transaction.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "The unique account identifier to inspect."
+          }
+        },
+        "required": ["account_id"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "check_compliance",
+      "description": "Runs KYC/AML, sanctions screening, and velocity limit checks on a PENDING transaction before it can transition to VALIDATED.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "transaction_id": {
+            "type": "string",
+            "description": "Unique transaction reference ID (must already be staged in PENDING state)."
+          },
+          "sender_account_id": {
+            "type": "string",
+            "description": "Source account ID initiating the funds movement."
+          },
+          "recipient_account_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "List of destination account IDs receiving funds."
+          },
+          "total_amount": {
+            "type": "number",
+            "description": "Total gross transaction amount in base currency units."
+          },
+          "jurisdiction": {
+            "type": "string",
+            "enum": ["US", "EU", "UK", "IN", "CROSS_BORDER"],
+            "description": "Regulatory jurisdiction governing the transfer."
+          }
+        },
+        "required": ["transaction_id", "sender_account_id", "recipient_account_ids", "total_amount", "jurisdiction"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "post_journal_entry",
+      "description": "Stages or transitions a double-entry journal block along the strict statechart: [*] -> PENDING -> VALIDATED -> COMMITTED, or PENDING -> FAILED -> ROLLED_BACK. Sum of DEBIT entries must equal sum of CREDIT entries.",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "transaction_id": {
+            "type": "string",
+            "description": "Unique identifier for the transaction block."
+          },
+          "target_state": {
+            "type": "string",
+            "enum": ["PENDING", "VALIDATED", "COMMITTED", "FAILED", "ROLLED_BACK"],
+            "description": "Target state transition in the transaction statechart."
+          },
+          "entries": {
+            "type": "array",
+            "description": "List of at least two ledger lines (debits and credits) that must balance to zero net difference.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "account_id": {
+                  "type": "string",
+                  "description": "Ledger account ID to debit or credit."
+                },
+                "entry_type": {
+                  "type": "string",
+                  "enum": ["DEBIT", "CREDIT"],
+                  "description": "Whether this line is a DEBIT or CREDIT."
+                },
+                "amount": {
+                  "type": "number",
+                  "description": "Positive monetary amount (up to 2 decimal places)."
+                }
+              },
+              "required": ["account_id", "entry_type", "amount"],
+              "additionalProperties": false
+            }
+          },
+          "memo": {
+            "type": "string",
+            "description": "Human-readable description or failure/rollback reason for the journal entry."
+          }
+        },
+        "required": ["transaction_id", "target_state", "entries", "memo"],
+        "additionalProperties": false
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "audit_transaction",
+      "description": "Verifies double-entry invariants (Debits == Credits, Assets == Liabilities + Equity) and records an immutable SHA-256 audit trail entry for terminal states (COMMITTED or ROLLED_BACK).",
+      "strict": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "transaction_id": {
+            "type": "string",
+            "description": "The transaction ID to audit and seal."
+          },
+          "expected_terminal_state": {
+            "type": "string",
+            "enum": ["COMMITTED", "ROLLED_BACK"],
+            "description": "The final state the transaction must be in when audited."
+          },
+          "compliance_token": {
+            "type": "string",
+            "description": "Verification token from check_compliance (or 'COMPLIANCE_FAILED' / 'OVERDRAFT_HALT' / 'INVARIANT_MISMATCH' if rolled back)."
+          },
+          "auditor_notes": {
+            "type": "string",
+            "description": "Summary of invariant verification and final disposition."
+          }
+        },
+        "required": ["transaction_id", "expected_terminal_state", "compliance_token", "auditor_notes"],
+        "additionalProperties": false
+      }
+    }
+  }
+]
+

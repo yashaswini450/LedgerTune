@@ -1,0 +1,12 @@
+# Core simulation, trajectory synthesis, GRPO reward calculation, and AuditKIT harness
+# run deterministically using Python >= 3.10 standard library (`decimal`, `hashlib`, `json`, `dataclasses`).
+
+# Optional Lexsi Labs Post-Training & Auditing Stack for GPU Cluster Execution:
+# agenttune>=0.1.0
+# auditkit>=0.1.0
+# torch>=2.2.0
+# transformers>=4.44.0
+# peft>=0.12.0
+# trl>=0.10.0
+# pyyaml>=6.0
+

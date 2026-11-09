@@ -1,0 +1,65 @@
+# Lexsi Labs AgentTune / AlignTune Post-Training Configuration
+# Track 3: Agentic Fine-Tuning — Double-Entry Financial Ledger Workflow Agent
+
+project:
+  name: "lexsi-double-entry-ledger-agent"
+  track: "Track 3: Agentic Fine-Tuning"
+  seed: 42
+  output_dir: "./checkpoints/ledger_agent_v1"
+
+model:
+  base_model_name_or_path: "Qwen/Qwen2.5-7B-Instruct"
+  torch_dtype: "bfloat16"
+  attn_implementation: "flash_attention_2"
+  max_seq_length: 4096
+  use_peft: true
+  lora_config:
+    r: 32
+    lora_alpha: 64
+    lora_dropout: 0.05
+    target_modules:
+      - "q_proj"
+      - "k_proj"
+      - "v_proj"
+      - "o_proj"
+      - "gate_proj"
+      - "up_proj"
+      - "down_proj"
+
+dataset:
+  format: "agenttune_jsonl"
+  train_file: "data/agenttune_sft_train.jsonl"
+  validation_file: "data/agenttune_sft_val.jsonl"
+  canonical_reference_file: "data/agenttune_canonical_5.jsonl"
+  tool_schema_file: "src/phase1_architecture/tool_schemas.json"
+  mask_user_and_tool_observations: true  # Compute SFT loss strictly on assistant thoughts & tool_calls
+
+stage1_sft:
+  enabled: true
+  num_train_epochs: 3
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-5
+  lr_scheduler_type: "cosine"
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  logging_steps: 5
+  eval_strategy: "steps"
+  eval_steps: 25
+
+stage2_grpo:
+  enabled: true
+  algorithm: "grpo"
+  num_generations_per_prompt: 4
+  max_turns_per_episode: 10
+  kl_coef: 0.04
+  learning_rate: 5.0e-6
+  reward_function:
+    module: "src.phase3_agenttune.reward_functions"
+    callable: "compute_double_entry_grpo_reward"
+    weights:
+      r_syntax: 0.25
+      r_accounting: 0.30
+      r_statechart: 0.30
+      r_efficiency: 0.15
+
