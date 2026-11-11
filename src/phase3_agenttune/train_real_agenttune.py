@@ -158,93 +158,117 @@ def main() -> None:
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--skip-grpo", action="store_true", help="Run Stage-1 SFT + AuditKIT eval only")
+    parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate saved checkpoints in ./checkpoints/")
     args = parser.parse_args()
 
-    from datasets import Dataset
-    from agenttune import create_distill_trainer
-    from agenttune.core.backend_factory import create_agentic_trainer
+    import gc
+    import torch
 
-    train_jsonl = ROOT_DIR / "data" / "agenttune_sft_train.jsonl"
-    print(f"=== [Stage 1] Building Full-Tier AgentTune EventLogs from {train_jsonl.name} ===")
-    eventlogs = build_full_tier_eventlogs(train_jsonl)
-    print(f"Loaded {len(eventlogs)} full-tier EventLogs.")
+    def _free_vram() -> None:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    print(f"\n=== [Stage 1] Running AgentTune SFT / Distillation on {args.base_model} ===")
-    distill_trainer = create_distill_trainer(
-        student=args.base_model,
-        trajectories=eventlogs,
-        output_dir=args.sft_output_dir,
-        use_peft=True,
-        lora_r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        num_train_epochs=args.sft_epochs,
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=4,
-        learning_rate=2e-4,
-        logging_steps=5,
-        save_strategy="epoch",
-        report_to="none",
-    )
-    sft_result = distill_trainer.train()
-    # Save LoRA adapter & tokenizer explicitly to sft_output_dir
-    distill_trainer.trainer_factory.sft_trainer.save_model(args.sft_output_dir)
-    distill_trainer.trainer_factory.tokenizer.save_pretrained(args.sft_output_dir)
-    print(f"Stage-1 SFT complete! Saved adapter -> {args.sft_output_dir} | {sft_result}")
+    grpo_adapter_path = args.grpo_output_dir if Path(args.grpo_output_dir).exists() else args.sft_output_dir
 
-    grpo_adapter_path = args.sft_output_dir
-    if not args.skip_grpo:
-        print(f"\n=== [Stage 2] Running AgentTune GRPO with Deterministic Double-Entry Reward ===")
-        with open(train_jsonl, "r", encoding="utf-8") as f:
-            raw_train = [json.loads(line) for line in f if line.strip()]
+    if not args.eval_only:
+        from datasets import Dataset
+        from agenttune import create_distill_trainer
+        from agenttune.core.backend_factory import create_agentic_trainer
 
-        grpo_rows = [
-            {
-                "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": r["messages"][1]["content"]},
-                ],
-                "expected_terminal_state": r["metadata"]["expected_terminal_state"],
-                "num_tool_steps": r["metadata"]["num_tool_steps"],
-            }
-            for r in raw_train
-        ]
-        grpo_dataset = Dataset.from_list(grpo_rows)
+        train_jsonl = ROOT_DIR / "data" / "agenttune_sft_train.jsonl"
+        print(f"=== [Stage 1] Building Full-Tier AgentTune EventLogs from {train_jsonl.name} ===")
+        eventlogs = build_full_tier_eventlogs(train_jsonl)
+        print(f"Loaded {len(eventlogs)} full-tier EventLogs.")
 
-        grpo_trainer = create_agentic_trainer(
-            algorithm="grpo",
-            model=args.base_model,
-            train_dataset=grpo_dataset,
-            tools=make_callable_ledger_tools(),
-            reward_funcs=[agenttune_grpo_reward_fn],
-            output_dir=args.grpo_output_dir,
-            max_steps=args.grpo_steps,
-            per_device_train_batch_size=1,
+        print(f"\n=== [Stage 1] Running AgentTune SFT / Distillation on {args.base_model} ===")
+        distill_trainer = create_distill_trainer(
+            student=args.base_model,
+            trajectories=eventlogs,
+            output_dir=args.sft_output_dir,
+            use_peft=True,
+            lora_r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            num_train_epochs=args.sft_epochs,
+            per_device_train_batch_size=2,
             gradient_accumulation_steps=4,
-            learning_rate=5e-6,
-            num_generations=2,
-            max_steps_per_turn=8,
-            max_completion_length=1024,
-            use_vllm=False,
-            peft_config={
-                "r": args.lora_r,
-                "lora_alpha": args.lora_alpha,
-                "target_modules": "all-linear",
-                "task_type": "CAUSAL_LM",
-            },
+            learning_rate=2e-4,
+            logging_steps=5,
+            save_strategy="epoch",
             report_to="none",
         )
-        grpo_res = grpo_trainer.train()
-        grpo_adapter_path = args.grpo_output_dir
-        print(f"Stage-2 GRPO complete! Saved -> {args.grpo_output_dir} | {grpo_res}")
+        sft_result = distill_trainer.train()
+        distill_trainer.trainer_factory.sft_trainer.save_model(args.sft_output_dir)
+        distill_trainer.trainer_factory.tokenizer.save_pretrained(args.sft_output_dir)
+        print(f"Stage-1 SFT complete! Saved adapter -> {args.sft_output_dir} | {sft_result}")
+        del distill_trainer
+        _free_vram()
 
-    print("\n=== [Stage 3] Running Live AuditKIT Evaluation on Held-Out Validation Set ===")
+        grpo_adapter_path = args.sft_output_dir
+        if not args.skip_grpo:
+            print("\n=== [Stage 2] Running AgentTune GRPO with Deterministic Double-Entry Reward ===")
+            with open(train_jsonl, "r", encoding="utf-8") as f:
+                raw_train = [json.loads(line) for line in f if line.strip()]
+
+            grpo_rows = [
+                {
+                    "prompt": [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": r["messages"][1]["content"]},
+                    ],
+                    "expected_terminal_state": r["metadata"]["expected_terminal_state"],
+                    "num_tool_steps": r["metadata"]["num_tool_steps"],
+                }
+                for r in raw_train
+            ]
+            grpo_dataset = Dataset.from_list(grpo_rows)
+
+            grpo_trainer = create_agentic_trainer(
+                algorithm="grpo",
+                model=args.base_model,
+                train_dataset=grpo_dataset,
+                tools=make_callable_ledger_tools(),
+                reward_funcs=[agenttune_grpo_reward_fn],
+                output_dir=args.grpo_output_dir,
+                max_steps=args.grpo_steps,
+                per_device_train_batch_size=1,
+                gradient_accumulation_steps=4,
+                learning_rate=5e-6,
+                num_generations=2,
+                max_steps_per_turn=8,
+                max_completion_length=1024,
+                use_vllm=False,
+                peft_config={
+                    "r": args.lora_r,
+                    "lora_alpha": args.lora_alpha,
+                    "target_modules": "all-linear",
+                    "task_type": "CAUSAL_LM",
+                },
+                report_to="none",
+            )
+            grpo_res = grpo_trainer.train()
+            if getattr(grpo_trainer, "trainer", None) is not None:
+                grpo_trainer.trainer.save_model(args.grpo_output_dir)
+            grpo_adapter_path = args.grpo_output_dir
+            print(f"Stage-2 GRPO complete! Saved -> {args.grpo_output_dir} | {grpo_res}")
+            del grpo_trainer
+            _free_vram()
+
+    print("\n=== [Stage 3] Running Live AuditKIT Evaluation (Sequential Lazy Load + VRAM Flush) ===")
     from auditkit_harness import run_full_auditkit_benchmark
-    from live_rollout import HFPolicy
+    from live_rollout import HFPolicy, _resolve_adapter_dir
 
     model_short = args.base_model.split("/")[-1]
-    base_policy = HFPolicy(args.base_model)
-    sft_policy = HFPolicy(args.base_model, adapter_path=args.sft_output_dir)
-    grpo_policy = HFPolicy(args.base_model, adapter_path=grpo_adapter_path)
+    resolved_sft = _resolve_adapter_dir(args.sft_output_dir)
+    resolved_grpo = _resolve_adapter_dir(grpo_adapter_path) or resolved_sft
+    print(f"  -> Baseline HF Model : {args.base_model}")
+    print(f"  -> SFT Adapter Path  : {resolved_sft}")
+    print(f"  -> GRPO Adapter Path : {resolved_grpo}")
+
+    # `lazy=True` ensures only ONE model is loaded into VRAM at a time and unloaded right after its 25 episodes!
+    base_policy = HFPolicy(args.base_model, lazy=True)
+    sft_policy = HFPolicy(args.base_model, adapter_path=resolved_sft, lazy=True) if resolved_sft else None
+    grpo_policy = HFPolicy(args.base_model, adapter_path=resolved_grpo, lazy=True) if resolved_grpo else None
 
     run_full_auditkit_benchmark(
         baseline_policy=base_policy,

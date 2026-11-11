@@ -1,0 +1,11 @@
+{
+  "schema": "lexsi.provenance/1",
+  "library": "agenttune",
+  "version": "1.1.4",
+  "git_sha": null,
+  "created_at": "2026-11-11T06:02:40Z",
+  "base_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "method": "agentic.grpo",
+  "inputs": [],
+  "params": {}
+}

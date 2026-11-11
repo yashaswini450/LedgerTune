@@ -524,6 +524,10 @@ def evaluate_model_with_auditkit(
             a_ep.final_state = {"terminal_state": rollout.get("final_tx_state", "NONE")}
             ak_episodes.append(a_ep)
 
+    # Free GPU VRAM immediately after finishing rollouts for this model
+    if model.live_policy is not None and hasattr(model.live_policy, "unload"):
+        model.live_policy.unload()
+
     native_rows_by_id: Dict[str, Dict[str, Any]] = {}
     if AUDITKIT_NATIVE_AVAILABLE and ak_cases:
         spec = AgentEvalSpec(

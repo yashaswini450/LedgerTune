@@ -1,0 +1,56 @@
+{
+  "model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "dataset_name": "unknown",
+  "output_dir": "./checkpoints/grpo_ledger",
+  "agentic_mode": true,
+  "tools": [
+    "create_account",
+    "get_account_balance",
+    "check_compliance",
+    "post_journal_entry",
+    "audit_transaction"
+  ],
+  "train_size": 130,
+  "eval_size": 0,
+  "final_loss": 0.0,
+  "total_steps": 40,
+  "training_history": [],
+  "metrics": {
+    "train_runtime": 2742.4365,
+    "train_samples_per_second": 0.058,
+    "train_steps_per_second": 0.015,
+    "total_flos": 0.0,
+    "train_loss": 0.0,
+    "epoch": 0.6153846153846154
+  },
+  "config_kwargs": {
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "train_dataset": "Dataset({\n    features: ['prompt', 'expected_terminal_state', 'num_tool_steps'],\n    num_rows: 130\n})",
+    "tools": [
+      "<function make_callable_ledger_tools.<locals>.create_account at 0x7f2298261440>",
+      "<function make_callable_ledger_tools.<locals>.get_account_balance at 0x7f22982611c0>",
+      "<function make_callable_ledger_tools.<locals>.check_compliance at 0x7f2298263240>",
+      "<function make_callable_ledger_tools.<locals>.post_journal_entry at 0x7f22982625c0>",
+      "<function make_callable_ledger_tools.<locals>.audit_transaction at 0x7f22982604a0>"
+    ],
+    "reward_funcs": [
+      "<function agenttune_grpo_reward_fn at 0x7f2543322b60>"
+    ],
+    "output_dir": "./checkpoints/grpo_ledger",
+    "max_steps": 40,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 5e-06,
+    "num_generations": 2,
+    "max_steps_per_turn": 8,
+    "max_completion_length": 1024,
+    "use_vllm": false,
+    "peft_config": {
+      "r": 16,
+      "lora_alpha": 32,
+      "target_modules": "all-linear",
+      "task_type": "CAUSAL_LM"
+    },
+    "report_to": "none"
+  }
+}

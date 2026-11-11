@@ -149,13 +149,42 @@ Evaluated on the held-out validation split (`data/agenttune_sft_val.jsonl`, 25 e
 
 ---
 
+### 4.3 Real L4 GPU Post-Training Telemetry & Provenance (`LL-2.ipynb` & `checkpoints/`)
+
+In addition to the controlled policy ablation benchmark above, this repository includes the complete artifacts, provenance logs, and live rollout telemetry from running [`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) on an **NVIDIA L4 GPU (24 GB VRAM)** with `Qwen/Qwen2.5-1.5B-Instruct` (see [`LL-2.ipynb`](LL-2.ipynb)):
+
+1. **Stage-1 `AgentTune` SFT Distillation (`create_distill_trainer` on 130 `EventLog` Trajectories):**
+   - **Checkpoint & State Log:** [`checkpoints/sft_ledger/checkpoint-51/trainer_state.json`](checkpoints/sft_ledger/checkpoint-51/trainer_state.json) (`LoRA r=16, alpha=32`, 3 epochs = 51 steps, `397,312` tokens, `119.3s` training runtime).
+   - **Monotonic Convergence:** Cross-entropy loss decreased by **$-75.7\%$** (from **`1.8025` $\to$ `0.4374`**), token-level accuracy increased by **$+21.95\%$** (from **`67.97%` $\to$ `89.92%`**), and policy entropy tightened from **`1.2386` $\to$ `0.5497`**.
+
+| Stage-1 SFT Step | Epoch | Tokens Seen | Training Loss | Mean Token Accuracy (%) | Policy Entropy | Grad Norm |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Step 5** | 0.31 | 40,960 | `1.8025` | `67.97%` | `1.2386` | `0.5639` |
+| **Step 15** | 0.92 | 122,880 | `1.3655` | `72.96%` | `1.4808` | `0.4989` |
+| **Step 25** | 1.49 | 198,656 | `0.9697` | `79.56%` | `1.0600` | `0.7005` |
+| **Step 35** | 2.06 | 274,432 | `0.6797` | `84.58%` | `0.7977` | `0.6094` |
+| **Step 50 (Final)** | 2.98 | 397,312 | **`0.4374`** | **`89.92%`** | **`0.5497`** | **`0.5106`** |
+
+2. **Stage-2 `AgentTune` Agentic GRPO (`create_agentic_trainer("grpo")`):**
+   - **Lexsi Provenance Seal:** [`checkpoints/grpo_ledger/lexsi_provenance.json`](checkpoints/grpo_ledger/lexsi_provenance.json) (`schema: "lexsi.provenance/1"`, `library: "agenttune"`, `version: "1.1.4"`, `method: "agentic.grpo"`).
+   - **Multi-Turn Rollout Archive:** [`checkpoints/grpo_ledger/trajectories.jsonl`](checkpoints/grpo_ledger/trajectories.jsonl) and [`checkpoints/grpo_ledger/training_stats.json`](checkpoints/grpo_ledger/training_stats.json) (40 optimization steps, **160 live multi-turn environment rollouts** across all 5 callable ledger tools with deterministic reward mean `+0.3531`, max `+0.4000`).
+3. **Live 1.5B-Parameter Rollout Diagnostics ([`data/auditkit_live_gpu_rollout_report.json`](data/auditkit_live_gpu_rollout_report.json)):**
+   - Evaluated via `auditkit v1.1.7` in unconstrained `live_model_rollout` mode on `Qwen/Qwen2.5-1.5B-Instruct`, the untuned zero-shot 1.5B baseline halts prematurely after **`1.36` steps** (`5.71%` Tool-Call F1, `0.00%` verified end-to-end outcome completion).
+   - Applying the Stage-1 `AgentTune` SFT adapter (`checkpoints/sft_ledger`) unlocks sustained multi-turn tool execution (`14.08` avg steps), **more than doubles live `AuditKIT Tool-Call F1` from `5.71%` $\to$ `13.51%` ($+136.6\%$ relative gain)**, and achieves the first complete 6-hop verified state completions on a compact 1.5B backbone while maintaining a **`0.00%` Unsafe Commit Violation Rate**.
+
+---
+
 ## 5. Repository Structure & End-to-End Execution Guide
 
 ```text
 Lexsi/
 ├── README.md                                      # Complete architectural & empirical documentation
+├── LL-2.ipynb                                     # Executed Google Colab (L4 GPU) AgentTune + AuditKIT notebook
 ├── requirements.txt                               # Dependencies for offline suite + GPU AgentTune/AuditKIT runs
 ├── run_all_validations.py                         # Master validation runner executing Phases 1-5 end-to-end
+├── checkpoints/
+│   ├── sft_ledger/                                # Stage-1 AgentTune SFT adapter config & trainer_state.json logs
+│   └── grpo_ledger/                               # Stage-2 AgentTune GRPO lexsi_provenance.json & 160 trajectories.jsonl
 ├── data/
 │   ├── phase2_canonical_5_trajectories.json       # 5 canonical multi-hop teacher trajectories
 │   ├── phase2_canonical_5_readable.md             # Human-readable [THOUGHT]/[TOOL_CALL]/[ARGUMENTS]/[OBSERVATION] traces
@@ -165,8 +194,10 @@ Lexsi/
 │   ├── agenttune_sft_val.jsonl                    # AgentTune held-out validation set (25 stratified episodes)
 │   ├── agenttune_native_val_trajectories.jsonl    # Native AgentTune Trajectory.to_dict() JSONL for AuditKIT import
 │   ├── agenttune_eventlog_sft_train.jsonl         # Native EventLog.as_dataset_rows('sft') with segment_weights
-│   ├── auditkit_evaluation_report.json            # Full AuditKIT v1.1.6 JSON output + SHA-256 fingerprints
-│   └── auditkit_evaluation_summary.md             # AuditKIT empirical markdown comparison table
+│   ├── auditkit_evaluation_report.json            # Controlled policy ablation AuditKIT report + SHA-256 fingerprints
+│   ├── auditkit_evaluation_summary.md             # Controlled policy ablation AuditKIT markdown summary
+│   ├── auditkit_live_gpu_rollout_report.json      # Live L4 GPU rollout AuditKIT report on Qwen2.5-1.5B-Instruct
+│   └── auditkit_live_gpu_rollout_summary.md       # Live L4 GPU rollout AuditKIT markdown summary
 └── src/
     ├── phase1_architecture/
     │   ├── tool_schemas.json                      # Strict JSON schemas for all 5 ledger tools

@@ -213,6 +213,44 @@ def compute_double_entry_grpo_reward(
     }
 
 
+def _parse_text_completion_to_messages(text: str) -> List[Dict[str, Any]]:
+    """Parse flattened Qwen/TRL multi-turn `<tool_call>` / `<tool_response>` text into OpenAI messages."""
+    import re
+
+    msgs: List[Dict[str, Any]] = []
+    call_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+    resp_pattern = re.compile(r"<tool_response>\s*(\{.*?\})\s*</tool_response>", re.DOTALL)
+
+    calls = call_pattern.findall(text)
+    resps = resp_pattern.findall(text)
+    for idx, raw_call in enumerate(calls):
+        call_id = f"call_parsed_{idx}"
+        try:
+            parsed = json.loads(raw_call)
+            name = parsed.get("name", "unknown")
+            args = parsed.get("arguments", {})
+            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+        except Exception:
+            name = "invalid_json"
+            args_str = raw_call
+        msgs.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": args_str},
+                    }
+                ],
+            }
+        )
+        if idx < len(resps):
+            msgs.append({"role": "tool", "tool_call_id": call_id, "content": resps[idx]})
+    return msgs
+
+
 def agenttune_grpo_reward_fn(
     completions: List[Any],
     prompts: List[Any] | None = None,
@@ -223,8 +261,8 @@ def agenttune_grpo_reward_fn(
 ) -> List[float]:
     """Native `TrlAgenticGrpo` reward function (`create_agentic_trainer("grpo", reward_funcs=...)`).
 
-    Accepts `completions` as a list of multi-turn message lists (or `trajectories` from
-    `create_rollout_fn`) and returns a `list[float]` of deterministic double-entry rewards.
+    Accepts `completions` as a list of multi-turn message lists, flattened `<tool_call>` strings,
+    or `trajectories` from `create_rollout_fn`, returning a `list[float]` of deterministic rewards.
     """
     schemas = load_tool_schemas()
     rewards: List[float] = []
@@ -236,11 +274,20 @@ def agenttune_grpo_reward_fn(
         if num_tool_steps and i < len(num_tool_steps):
             meta["num_tool_steps"] = num_tool_steps[i]
 
+        msgs: List[Dict[str, Any]] = []
         if isinstance(comp, list) and comp and isinstance(comp[0], dict):
             msgs = comp
-        elif trajectories and i < len(trajectories) and hasattr(trajectories[i], "to_trl_format"):
-            msgs = trajectories[i].to_trl_format()["messages"]
-        else:
+        elif trajectories and i < len(trajectories):
+            traj = trajectories[i]
+            if hasattr(traj, "metadata") and isinstance(traj.metadata, dict) and "conversation" in traj.metadata:
+                msgs = traj.metadata["conversation"]
+            elif hasattr(traj, "to_trl_format"):
+                msgs = traj.to_trl_format().get("messages", [])
+            elif isinstance(traj, dict) and "metadata" in traj:
+                msgs = traj["metadata"].get("conversation", [])
+        if not msgs and isinstance(comp, str):
+            msgs = _parse_text_completion_to_messages(comp)
+        if not msgs:
             rewards.append(-0.50)
             continue
 

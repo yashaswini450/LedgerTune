@@ -170,29 +170,76 @@ def parse_hermes_tool_calls(text: str) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
-# Backend 1: local HuggingFace model (+ optional LoRA adapter)
+# Backend 1: local HuggingFace model (+ optional LoRA adapter) with lazy load & VRAM cleanup
 # -----------------------------------------------------------------------------
+def _resolve_adapter_dir(adapter_path: Optional[str]) -> Optional[str]:
+    """Resolves adapter directory (or latest checkpoint-* subdirectory if saved by Trainer)."""
+    if not adapter_path:
+        return None
+    p = Path(adapter_path)
+    if not p.exists():
+        return None
+    if (p / "adapter_config.json").exists() or (p / "config.json").exists():
+        return str(p)
+    ckpts = sorted(
+        [d for d in p.glob("checkpoint-*") if d.is_dir()],
+        key=lambda x: int(x.name.split("-")[-1]) if x.name.split("-")[-1].isdigit() else 0,
+    )
+    if ckpts:
+        return str(ckpts[-1])
+    return None
+
+
 class HFPolicy:
     def __init__(self, model_name_or_path: str, adapter_path: Optional[str] = None,
-                 max_new_tokens: int = 768, load_in_4bit: bool = False) -> None:
-        import torch  # local import so the rest of the repo needs no torch
+                 max_new_tokens: int = 512, load_in_4bit: bool = False, lazy: bool = True) -> None:
+        self.model_name_or_path = model_name_or_path
+        self.adapter_path = _resolve_adapter_dir(adapter_path)
+        self.max_new_tokens = max_new_tokens
+        self.load_in_4bit = load_in_4bit
+        self.tok = None
+        self.model = None
+        if not lazy:
+            self._ensure_loaded()
+
+    def _ensure_loaded(self) -> None:
+        if self.model is not None:
+            return
+        import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        kwargs: Dict[str, Any] = {"torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                                  "device_map": "auto"}
-        if load_in_4bit:
+        kwargs: Dict[str, Any] = {
+            "torch_dtype": torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+            "device_map": "auto",
+        }
+        if self.load_in_4bit:
             from transformers import BitsAndBytesConfig
-            kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-        self.tok = AutoTokenizer.from_pretrained(model_name_or_path)
-        self.model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **kwargs)
-        if adapter_path:
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16
+            )
+        self.tok = AutoTokenizer.from_pretrained(self.model_name_or_path)
+        self.model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, **kwargs)
+        if self.adapter_path:
             from peft import PeftModel
-            self.model = PeftModel.from_pretrained(self.model, adapter_path)
+            self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
         self.model.eval()
-        self.max_new_tokens = max_new_tokens
+
+    def unload(self) -> None:
+        """Frees GPU VRAM immediately after evaluating this checkpoint."""
+        import gc
+        self.model = None
+        self.tok = None
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def __call__(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         import torch
+        self._ensure_loaded()
         prompt = self.tok.apply_chat_template(
             messages_for_chat_template(messages), tools=tools, add_generation_prompt=True, tokenize=False
         )

@@ -1,16 +1,16 @@
 # Phase 4: AuditKIT Evaluation Report
 
-- **AuditKIT Engine:** `auditkit v1.1.6` (`AgentEvalRunner` + Double-Entry Invariant Suite)
+- **AuditKIT Engine:** `auditkit vstandalone` (`AgentEvalRunner` + Double-Entry Invariant Suite)
 - **Evaluation Mode:** `controlled_policy_ablation`
 - **Dataset Split:** `agenttune_sft_val.jsonl` (25 held-out multi-hop validation episodes across all 5 workflow archetypes)
-- **`episodes_from_agenttune` Bridge Verified:** `True`
+- **`episodes_from_agenttune` Bridge Verified:** `False`
 
 ## Aggregate Benchmark Comparison
 
 | Metric | Baseline (`Zero-Shot`) | AgentTune Stage-1 (`SFT`) | AgentTune Stage-2 (`SFT + GRPO`) | Delta (`GRPO` vs. `Baseline`) |
 | :--- | :---: | :---: | :---: | :---: |
 | **Tool-Call Syntax Accuracy (%)** | 97.78% | 100.00% | **100.00%** | **+2.22%** |
-| **AuditKIT Tool-Call F1 (%)** | 62.35% | 98.93% | **100.00%** | **+37.65%** |
+| **AuditKIT Tool-Call F1 (%)** | 97.78% | 100.00% | **100.00%** | **+2.22%** |
 | **Avg Steps to Completion** *(Optimal = 6.60)* | 7.80 steps | 6.76 steps | **6.60 steps** | **-1.20 steps** |
 | **Trajectory Efficiency (%)** | 85.28% | 98.00% | **100.00%** | **+14.72%** |
 | **Double-Entry Invariant Rate (%)** | 80.00% | 100.00% | **100.00%** | **+20.00%** |

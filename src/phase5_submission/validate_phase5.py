@@ -65,6 +65,7 @@ def validate_phase5_submission() -> None:
     print("\n=== [3/3] Validating Complete Repository File Manifest ===")
     expected_files = [
         "README.md",
+        "LL-2.ipynb",
         "requirements.txt",
         "run_all_validations.py",
         "src/phase1_architecture/tool_schemas.json",
@@ -91,6 +92,12 @@ def validate_phase5_submission() -> None:
         "data/agenttune_eventlog_sft_train.jsonl",
         "data/auditkit_evaluation_report.json",
         "data/auditkit_evaluation_summary.md",
+        "data/auditkit_live_gpu_rollout_report.json",
+        "data/auditkit_live_gpu_rollout_summary.md",
+        "checkpoints/sft_ledger/checkpoint-51/trainer_state.json",
+        "checkpoints/grpo_ledger/lexsi_provenance.json",
+        "checkpoints/grpo_ledger/training_stats.json",
+        "checkpoints/grpo_ledger/trajectories.jsonl",
     ]
     for rel_path in expected_files:
         p = ROOT_DIR / rel_path
