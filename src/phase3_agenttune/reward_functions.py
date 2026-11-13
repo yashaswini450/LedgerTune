@@ -15,8 +15,10 @@ trajectory reward R(tau) in [-0.50, +1.00] into 4 verifiable components:
 from __future__ import annotations
 
 from decimal import Decimal
+import ast
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Dict, List
 
@@ -40,16 +42,22 @@ def compute_double_entry_grpo_reward(
 
     syntax_valid_calls = 0
     total_calls = 0
+    last_call_id = ""
 
-    for msg in messages:
+    for msg_idx, msg in enumerate(messages):
         role = msg.get("role")
-        if role == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
+        tcs = list(msg.get("tool_calls") or [])
+        if role == "assistant" and not tcs and isinstance(msg.get("content"), str):
+            tcs = _extract_inline_tool_calls(msg["content"], prefix=f"inline_{msg_idx}")
+
+        if role == "assistant" and tcs:
+            for tc in tcs:
                 total_calls += 1
-                fn = tc.get("function", {})
-                fn_name = fn.get("name", "")
-                raw_args = fn.get("arguments", "{}")
-                call_id = tc.get("id", "")
+                fn = tc.get("function", tc)
+                fn_name = fn.get("name") or fn.get("tool_name") or ""
+                raw_args = fn.get("arguments", fn.get("parameters", "{}"))
+                call_id = tc.get("id") or f"call_{msg_idx}_{total_calls}"
+                last_call_id = call_id
 
                 try:
                     parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -68,8 +76,16 @@ def compute_double_entry_grpo_reward(
                     allowed_keys = set(param_schema.get("properties", {}).keys())
                     actual_keys = set(parsed_args.keys())
                     if req_keys.issubset(actual_keys) and actual_keys.issubset(allowed_keys):
-                        syntax_valid_calls += 1
-                        is_valid = True
+                        if fn_name == "post_journal_entry":
+                            ents = parsed_args.get("entries")
+                            is_valid = isinstance(ents, list) and len(ents) > 0 and all(
+                                isinstance(e, dict) and {"account_id", "entry_type", "amount"}.issubset(e.keys())
+                                for e in ents
+                            )
+                        else:
+                            is_valid = True
+                        if is_valid:
+                            syntax_valid_calls += 1
                     else:
                         is_valid = False
                 else:
@@ -79,12 +95,13 @@ def compute_double_entry_grpo_reward(
                     {"id": call_id, "name": fn_name, "args": parsed_args, "valid_syntax": is_valid}
                 )
 
-        elif role == "tool":
-            call_id = msg.get("tool_call_id", "")
-            try:
-                obs_data = json.loads(msg.get("content", "{}"))
-            except Exception:
-                obs_data = {"status": "INVALID_JSON"}
+        elif role == "tool" or (
+            role == "user"
+            and isinstance(msg.get("content"), str)
+            and ("Tool result" in msg["content"] or msg["content"].strip().startswith("{"))
+        ):
+            call_id = msg.get("tool_call_id") or last_call_id
+            obs_data = _parse_obs_payload(msg.get("content", "{}"))
             tool_observations[call_id] = obs_data
 
     if total_calls == 0:
@@ -213,60 +230,137 @@ def compute_double_entry_grpo_reward(
     }
 
 
-def _parse_text_completion_to_messages(text: str) -> List[Dict[str, Any]]:
-    """Parse flattened Qwen/TRL multi-turn `<tool_call>` / `<tool_response>` text into OpenAI messages."""
-    import re
-
-    msgs: List[Dict[str, Any]] = []
-    call_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
-    resp_pattern = re.compile(r"<tool_response>\s*(\{.*?\})\s*</tool_response>", re.DOTALL)
-
-    calls = call_pattern.findall(text)
-    resps = resp_pattern.findall(text)
-    for idx, raw_call in enumerate(calls):
-        call_id = f"call_parsed_{idx}"
+def _parse_obs_payload(raw_content: str) -> Dict[str, Any]:
+    """Parses tool observation JSON or Python repr dict string (from AgentTune tool execution)."""
+    text = raw_content.strip()
+    if ":" in text and text.lower().startswith("tool result"):
+        text = text.split(":", 1)[1].strip()
+    for parser in (json.loads, ast.literal_eval):
         try:
-            parsed = json.loads(raw_call)
-            name = parsed.get("name", "unknown")
-            args = parsed.get("arguments", {})
+            val = parser(text)
+            if isinstance(val, dict):
+                # Unwrap nested single-tool observation dict if wrapped as {'tool_name': '{...}'}
+                if len(val) == 1 and "status" not in val:
+                    inner = next(iter(val.values()))
+                    if isinstance(inner, dict):
+                        return inner
+                    if isinstance(inner, str):
+                        for p2 in (json.loads, ast.literal_eval):
+                            try:
+                                v2 = p2(inner)
+                                if isinstance(v2, dict):
+                                    return v2
+                            except Exception:
+                                pass
+                return val
+        except Exception:
+            pass
+    return {"status": "INVALID_JSON"}
+
+
+def _extract_inline_tool_calls(text: str, prefix: str = "call") -> List[Dict[str, Any]]:
+    """Extracts tool calls from `<tool_call>{...}</tool_call>`, `<|START_ACTION|>[...]<|END_ACTION|>`,
+    or AgentTune's Cohere fallback `[{"tool_name": ..., "parameters": {...}}]`."""
+    calls: List[Dict[str, Any]] = []
+    tc_blocks = re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL)
+    for idx, blk in enumerate(tc_blocks):
+        try:
+            obj = json.loads(blk)
+            name = obj.get("name") or obj.get("tool_name") or "unknown"
+            args = obj.get("arguments", obj.get("parameters", {}))
             args_str = json.dumps(args) if isinstance(args, dict) else str(args)
         except Exception:
-            name = "invalid_json"
-            args_str = raw_call
-        msgs.append(
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": name, "arguments": args_str},
-                    }
-                ],
-            }
-        )
+            name, args_str = "invalid_json", blk
+        calls.append({"id": f"{prefix}_{idx}", "type": "function", "function": {"name": name, "arguments": args_str}})
+    if calls:
+        return calls
+
+    action_blocks = re.findall(r"<\|START_ACTION\|>\s*(.*?)\s*<\|END_ACTION\|>", text, re.DOTALL)
+    candidates = action_blocks if action_blocks else re.findall(r"(\[\s*\{.*?\}\s*\])", text, re.DOTALL)
+    for blk in candidates:
+        for parser in (json.loads, ast.literal_eval):
+            try:
+                arr = parser(blk)
+                if isinstance(arr, dict):
+                    arr = [arr]
+                if isinstance(arr, list):
+                    for idx, item in enumerate(arr):
+                        if isinstance(item, dict) and ("tool_name" in item or "name" in item):
+                            name = item.get("tool_name") or item.get("name") or "unknown"
+                            args = item.get("parameters", item.get("arguments", {}))
+                            args_str = json.dumps(args) if isinstance(args, dict) else str(args)
+                            calls.append(
+                                {
+                                    "id": f"{prefix}_arr_{idx}",
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": args_str},
+                                }
+                            )
+                    if calls:
+                        return calls
+            except Exception:
+                pass
+    return calls
+
+
+def _parse_text_completion_to_messages(text: str) -> List[Dict[str, Any]]:
+    """Parse flattened multi-turn `<tool_call>` / `<tool_response>` / Cohere fallback text into messages."""
+    msgs: List[Dict[str, Any]] = []
+    calls = _extract_inline_tool_calls(text, prefix="call_parsed")
+    resps = re.findall(r"<tool_response>\s*(\{.*?\})\s*</tool_response>", text, re.DOTALL)
+    if not resps:
+        resps = re.findall(r"Tool result[^:\n]*:\s*(\{.*?\})(?:\n|$)", text)
+    for idx, tc in enumerate(calls):
+        call_id = tc["id"]
+        msgs.append({"role": "assistant", "content": "", "tool_calls": [tc]})
         if idx < len(resps):
             msgs.append({"role": "tool", "tool_call_id": call_id, "content": resps[idx]})
     return msgs
 
 
+def _messages_from_trajectory_obj(traj: Any) -> List[Dict[str, Any]]:
+    """Extracts multi-turn OpenAI conversation messages from an AgentTune Trajectory object or dict."""
+    if hasattr(traj, "metadata") and isinstance(traj.metadata, dict) and "conversation" in traj.metadata:
+        return traj.metadata["conversation"]
+    if isinstance(traj, dict):
+        if "metadata" in traj and isinstance(traj["metadata"], dict) and "conversation" in traj["metadata"]:
+            return traj["metadata"]["conversation"]
+        if "messages" in traj and isinstance(traj["messages"], list):
+            return traj["messages"]
+    if hasattr(traj, "to_trl_format"):
+        return traj.to_trl_format().get("messages", [])
+    return []
+
+
 def agenttune_grpo_reward_fn(
-    completions: List[Any],
+    completions: Any,
     prompts: List[Any] | None = None,
     trajectories: List[Any] | None = None,
     expected_terminal_state: List[str] | None = None,
     num_tool_steps: List[int] | None = None,
     **kwargs: Any,
-) -> List[float]:
+) -> Any:
     """Native `TrlAgenticGrpo` reward function (`create_agentic_trainer("grpo", reward_funcs=...)`).
 
-    Accepts `completions` as a list of multi-turn message lists, flattened `<tool_call>` strings,
-    or `trajectories` from `create_rollout_fn`, returning a `list[float]` of deterministic rewards.
+    Supports all three AgentTune reward call signatures:
+      1. `fn(trajectory) -> float` (single Trajectory object passed during rollout collection)
+      2. `fn(completions, prompts=..., trajectories=..., **kwargs) -> list[float]` (TRL batch call)
+      3. `fn(responses, prompts) -> list[float]` (text completion batch call)
     """
     schemas = load_tool_schemas()
-    rewards: List[float] = []
 
+    # Signature 1: Single Trajectory object or single trajectory dict -> return a single float
+    if not isinstance(completions, list):
+        msgs = _messages_from_trajectory_obj(completions)
+        if not msgs and isinstance(completions, str):
+            msgs = _parse_text_completion_to_messages(completions)
+        if not msgs:
+            return -0.50
+        res = compute_double_entry_grpo_reward(msgs, schemas)
+        return float(res["total_reward"])
+
+    # Signature 2 & 3: Batch list of completions/trajectories -> return list[float]
+    rewards: List[float] = []
     for i, comp in enumerate(completions):
         meta: Dict[str, Any] = {}
         if expected_terminal_state and i < len(expected_terminal_state):
@@ -275,18 +369,20 @@ def agenttune_grpo_reward_fn(
             meta["num_tool_steps"] = num_tool_steps[i]
 
         msgs: List[Dict[str, Any]] = []
-        if isinstance(comp, list) and comp and isinstance(comp[0], dict):
-            msgs = comp
-        elif trajectories and i < len(trajectories):
-            traj = trajectories[i]
-            if hasattr(traj, "metadata") and isinstance(traj.metadata, dict) and "conversation" in traj.metadata:
-                msgs = traj.metadata["conversation"]
-            elif hasattr(traj, "to_trl_format"):
-                msgs = traj.to_trl_format().get("messages", [])
-            elif isinstance(traj, dict) and "metadata" in traj:
-                msgs = traj["metadata"].get("conversation", [])
-        if not msgs and isinstance(comp, str):
-            msgs = _parse_text_completion_to_messages(comp)
+        # Always prioritize `trajectories[i]` first because TRL's `comp` often contains only the
+        # final turn text (`final_response`), whereas `trajectories[i].metadata["conversation"]`
+        # holds the full multi-turn tool-calling trajectory!
+        if trajectories and i < len(trajectories):
+            msgs = _messages_from_trajectory_obj(trajectories[i])
+
+        if not msgs:
+            if isinstance(comp, list) and comp and isinstance(comp[0], dict):
+                msgs = comp
+            elif isinstance(comp, dict) or hasattr(comp, "metadata"):
+                msgs = _messages_from_trajectory_obj(comp)
+            elif isinstance(comp, str):
+                msgs = _parse_text_completion_to_messages(comp)
+
         if not msgs:
             rewards.append(-0.50)
             continue

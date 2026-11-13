@@ -177,7 +177,36 @@ From the recorded Colab run ([`checkpoints/grpo_ledger/`](checkpoints/grpo_ledge
 
 ---
 
-## 7. Repository structure
+## 7. ROI & Deployment Economics: Self-Hosted Compact Agent vs. Closed-Source Frontier API
+
+In regulated financial ledger processing, every workflow episode requires an average of **6.60 multi-hop tool turns** (`~3,200` cumulative input tokens of growing conversation context + tool schemas and `~650` output tokens of thoughts, `<tool_call>` JSON payloads, and final audit summaries per transaction).
+
+### Workload & Throughput Assumptions
+- **Realistic Sample Volume:** `100,000` multi-hop ledger workflow transactions per month (`~3,333` workflows/day), representing a mid-sized digital wallet or payment settlement desk:
+  - **Monthly Input Volume:** $100,000 \times 3,200 = 320.0\text{M input tokens/month}$
+  - **Monthly Output Volume:** $100,000 \times 650 = 65.0\text{M output tokens/month}$
+- **Self-Hosted Hardware (`1x NVIDIA L4 24GB GPU`):**
+  - **On-Demand Cloud GPU Pricing:** `\$0.80 / hour` (standard AWS `g6.xlarge` / GCP `g2-standard-4` L4 rate).
+  - **Measured Training Cost (One-Time):** Stage-1 SFT (`119s`) + Stage-2 GRPO (`2,742s`) = **`0.80 GPU hours` (`\$0.64` total one-time training compute)**.
+  - **Serving Throughput (`CohereLabs/tiny-aya-global` 3.35B / `Qwen2.5-1.5B` via batched vLLM on L4):** Conservatively `~1,200 output tokens/sec` (with prefix caching on the shared system prompt + tool schemas).
+  - **Active GPU Runtime Hours Required for 100k Workflows:**
+    $$\frac{65,000,000\text{ output tokens}}{1,200\text{ tokens/sec} \times 3,600\text{ sec/hr}} \approx 15.05\text{ GPU hours/month}$$
+
+| Cost & Operational Dimension | Closed-Source Frontier API *(e.g. GPT-4o / Claude 3.5 Sonnet @ \$2.50–\$3.00 / 1M in, \$10.00–\$15.00 / 1M out)* | Self-Hosted `Tiny Aya Global (3.35B)` / `Qwen2.5 (1.5B)` on On-Demand L4 GPU *(Batched Job / Serverless Auto-Scale)* | Dedicated 24/7 Self-Hosted L4 Instance *(720 hrs/month @ \$0.80/hr)* |
+| :--- | :---: | :---: | :---: |
+| **Input Token Billing (320M tokens)** | `\$800.00 – \$960.00` | `\$0.00` *(included in GPU time)* | `\$0.00` *(included in GPU time)* |
+| **Output Token Billing (65M tokens)** | `\$650.00 – \$975.00` | `\$0.00` *(included in GPU time)* | `\$0.00` *(included in GPU time)* |
+| **Compute / GPU Runtime Hours** | Managed API | **`15.1 hrs/month` @ `\$0.80/hr`** | **`720 hrs/month` @ `\$0.80/hr`** |
+| **One-Time Post-Training Cost (`AgentTune`)** | N/A | **`\$0.64`** *(0.80 L4 GPU hours)* | **`\$0.64`** *(0.80 L4 GPU hours)* |
+| **Total Monthly Inference Cost (100k tx)** | **`\$1,450.00 – \$1,935.00 / mo`** | **`\$12.04 / mo` (`99.2%` lower)** | **`\$576.00 / mo` (`60.3%` lower)** |
+| **Cost per 1,000 Audited Workflows** | `\$14.50 – \$19.35` | **`\$0.12`** | **`\$5.76`** *(with >95% spare capacity)* |
+| **Data Residency & PII/KYC Privacy** | External 3rd-party API egress | **100% On-VPC / Air-Gapped** | **100% On-VPC / Air-Gapped** |
+
+> **Engineering Takeaway:** Even before reaching 100% autonomous completion on every workflow, routing deterministic ledger staging through a self-hosted 1.5B–3.35B model inside `DoubleEntryLedgerEnv` (where the environment's statechart guards deterministically block any invalid transition and only escalate unresolvable edge cases) cuts token expenditure by **60% to 99%** while keeping sensitive KYC/AML customer records strictly inside the custodian's VPC.
+
+---
+
+## 8. Repository structure
 
 ```text
 Lexsi/
@@ -186,8 +215,10 @@ Lexsi/
 ├── requirements.txt
 ├── run_all_validations.py                      # Runs the 5 phase gates (offline, < 5 s)
 ├── checkpoints/
-│   ├── sft_ledger/                             # Stage-1 adapter config + trainer_state.json logs (weights not committed)
-│   └── grpo_ledger/                            # Stage-2 training_stats, provenance, 160 rollouts (weights not committed)
+│   ├── sft_ledger/                             # Iteration 1 (Qwen2.5-1.5B) Stage-1 SFT config + trainer_state.json
+│   ├── grpo_ledger/                            # Iteration 1 (Qwen2.5-1.5B) Stage-2 GRPO stats, provenance & 160 rollouts
+│   ├── sft_tiny_aya/                           # Iteration 2 (CohereLabs/tiny-aya-global) Stage-1 SFT checkpoint
+│   └── grpo_tiny_aya/                          # Iteration 2 (CohereLabs/tiny-aya-global) Stage-2 GRPO checkpoint
 ├── data/
 │   ├── phase2_canonical_5_trajectories.json    # 5 canonical teacher trajectories
 │   ├── phase2_canonical_5_readable.md          # Human-readable traces
@@ -197,8 +228,10 @@ Lexsi/
 │   ├── agenttune_sft_val.jsonl                 # 25 held-out episodes
 │   ├── agenttune_native_val_trajectories.jsonl # AgentTune Trajectory.to_dict() format
 │   ├── agenttune_eventlog_sft_train.jsonl      # EventLog.as_dataset_rows("sft") format (used for SFT)
-│   ├── auditkit_live_gpu_rollout_report.json   # REAL: live rollouts of trained models (Colab L4)
+│   ├── auditkit_live_gpu_rollout_report.json   # REAL: live rollouts of Qwen2.5-1.5B (Colab L4)
 │   ├── auditkit_live_gpu_rollout_summary.md
+│   ├── auditkit_live_tiny_aya_report.json      # REAL: live rollouts of CohereLabs/tiny-aya-global (Colab L4)
+│   ├── auditkit_live_tiny_aya_summary.md
 │   ├── auditkit_harness_sanity_check_report.json  # Scripted policies, no LLM (metric validation)
 │   └── auditkit_harness_sanity_check_summary.md
 └── src/
@@ -207,7 +240,7 @@ Lexsi/
     ├── phase3_agenttune/      prepare_agenttune_sft.py, reward_functions.py, train_real_agenttune.py,
     │                          agenttune_config.yaml, validate_phase3.py
     ├── phase4_auditkit/       live_rollout.py, auditkit_harness.py, validate_phase4.py
-    └── phase5_submission/     validate_phase5.py
+    └── phase5_submission/     validate_phase5.py, upload_to_hf.py
 ```
 
 ### Quickstart A: offline validation gates
@@ -218,17 +251,17 @@ python3 run_all_validations.py
 
 Checks tool schemas, statechart guards, ledger balance across all 150 trajectories, reward discrimination, the harness sanity check, and README/report consistency. Install AuditKIT first (`pip install "git+https://github.com/Lexsi-Labs/AuditKIT.git"`) to use its native scorers instead of the fallback.
 
-### Quickstart B: train and evaluate on a GPU
+### Quickstart B: train `CohereLabs/tiny-aya-global` (Rule 3) and evaluate on a GPU
 
 ```bash
 pip install "git+https://github.com/Lexsi-Labs/AgentTune.git" "git+https://github.com/Lexsi-Labs/AuditKIT.git"
-pip install torch transformers datasets trl peft accelerate
+pip install torch transformers datasets trl peft accelerate huggingface_hub
 
+# 1. Train CohereLabs/tiny-aya-global (saves to ./checkpoints/sft_tiny_aya and ./checkpoints/grpo_tiny_aya
+#    and writes live AuditKIT report to data/auditkit_live_tiny_aya_report.json without overwriting Qwen results)
 python3 src/phase3_agenttune/train_real_agenttune.py \
-    --base-model Qwen/Qwen2.5-1.5B-Instruct --sft-epochs 3 --grpo-steps 40
+    --base-model CohereLabs/tiny-aya-global --sft-epochs 3 --grpo-steps 30
 
-# Evaluation only, using saved adapters:
-python3 src/phase3_agenttune/train_real_agenttune.py --eval-only
+# 2. Upload all Models, Adapters, Logs, Datasets, and Reports to Hugging Face Hub & create Collections
+python3 src/phase5_submission/upload_to_hf.py
 ```
-
-Live evaluation writes to `data/auditkit_live_gpu_rollout_report.json`. The offline sanity check writes to `data/auditkit_harness_sanity_check_report.json`, so the two can't overwrite each other.

@@ -35,8 +35,17 @@ from reward_functions import agenttune_grpo_reward_fn  # noqa: E402
 
 
 def build_full_tier_eventlogs(train_jsonl: Path) -> List[Any]:
-    """Converts `data/agenttune_sft_train.jsonl` into `agenttune.agentic.EventLog(tier='full')` objects."""
+    """Converts `data/agenttune_sft_train.jsonl` into `agenttune.agentic.EventLog(tier='full')` objects.
+
+    Uses strict alternating `OBSERVATION` (`role: user`) and `TOOL_CALL` (`role: assistant`)
+    events so that:
+      1. Cohere Tiny Aya's default chat template (which drops `role: tool` turns as empty turns)
+         receives every tool observation as a `role: user` turn (`Tool result (...): {...}`).
+      2. Each assistant step is a single `<tool_call>{...}</tool_call>` turn without splitting
+         reasoning and tool call across two consecutive `assistant` EOS boundaries.
+    """
     from agenttune.agentic.events import Event, EventKind, EventLog
+    from live_rollout import TOOL_CALL_PROMPT_GUIDE
 
     logs: List[EventLog] = []
     with open(train_jsonl, "r", encoding="utf-8") as f:
@@ -47,17 +56,14 @@ def build_full_tier_eventlogs(train_jsonl: Path) -> List[Any]:
             msgs = rec["messages"]
 
             log = EventLog(tier="full", id=rec["id"])
-            # Initial user task
-            user_task = f"{msgs[0]['content']}\n\nTask: {msgs[1]['content']}"
+            # Initial user task with explicit tool-call format guide
+            user_task = f"{msgs[0]['content']}\n\n{TOOL_CALL_PROMPT_GUIDE}\n\nTask: {msgs[1]['content']}"
             log.append(Event(EventKind.OBSERVATION, {"text": user_task}))
 
             intermediate = msgs[2:-1]
             for i in range(0, len(intermediate), 2):
                 asst_msg = intermediate[i]
                 tool_msg = intermediate[i + 1]
-                thought_text = (asst_msg.get("content") or "").replace("[THOUGHT]\n", "").strip()
-                if thought_text:
-                    log.append(Event(EventKind.REASONING, {"text": thought_text}))
 
                 tc = asst_msg["tool_calls"][0]
                 fn_name = tc["function"]["name"]
@@ -68,7 +74,12 @@ def build_full_tier_eventlogs(train_jsonl: Path) -> List[Any]:
                         {"action": {"name": fn_name, "arguments": fn_args}},
                     )
                 )
-                log.append(Event(EventKind.TOOL_RESULT, {"output": tool_msg["content"]}))
+                log.append(
+                    Event(
+                        EventKind.OBSERVATION,
+                        {"text": f"Tool result ({fn_name}): {tool_msg['content']}"},
+                    )
+                )
                 log.append(Event(EventKind.TURN_COMPLETE, {"step": (i // 2) + 1}))
 
             # Final assistant summary with token_span so full-tier check passes
@@ -91,23 +102,44 @@ def make_callable_ledger_tools() -> List[Any]:
     """Creates typed Python tool callables backed by a DoubleEntryLedgerEnv instance
     for `create_agentic_trainer('grpo', tools=...)`."""
     env = DoubleEntryLedgerEnv()
-    env.create_account("ACC_ASSET_VAULT", "Omnibus Reserve Vault", "ASSET", "USD", "INSTITUTIONAL", 15000.0)
-    env.create_account("ACC_WALLET_ALICE", "Alice Rivera", "LIABILITY", "USD", "TIER_2_FULL", 5000.0)
-    env.create_account("ACC_WALLET_BOB", "Bob Chen", "LIABILITY", "USD", "TIER_2_FULL", 2000.0)
-    env.create_account("ACC_WALLET_CAROL", "Carol Vane", "LIABILITY", "USD", "SANCTIONED", 1500.0)
-    env.create_account("ACC_MERCHANT_ALPHA", "Alpha Logistics", "LIABILITY", "USD", "INSTITUTIONAL", 3000.0)
-    env.create_account("ACC_MERCHANT_BETA", "Beta Studios", "LIABILITY", "USD", "TIER_2_FULL", 1000.0)
-    env.create_account("ACC_REV_FEES", "Platform Fee Revenue", "REVENUE", "USD", "INSTITUTIONAL", 250.0)
-    env.create_account("ACC_EQUITY_RESERVE", "Core Equity", "EQUITY", "USD", "INSTITUTIONAL", 2250.0)
+
+    def _seed_default_accounts() -> None:
+        env.accounts.clear()
+        env.transactions.clear()
+        env.audit_log.clear()
+        env.create_account("ACC_ASSET_VAULT", "Omnibus Reserve Vault", "ASSET", "USD", "INSTITUTIONAL", 15000.0)
+        env.create_account("ACC_WALLET_ALICE", "Alice Rivera", "LIABILITY", "USD", "TIER_2_FULL", 5000.0)
+        env.create_account("ACC_WALLET_BOB", "Bob Chen", "LIABILITY", "USD", "TIER_2_FULL", 2000.0)
+        env.create_account("ACC_WALLET_CAROL", "Carol Vane", "LIABILITY", "USD", "SANCTIONED", 1500.0)
+        env.create_account("ACC_MERCHANT_ALPHA", "Alpha Logistics", "LIABILITY", "USD", "INSTITUTIONAL", 3000.0)
+        env.create_account("ACC_MERCHANT_BETA", "Beta Studios", "LIABILITY", "USD", "TIER_2_FULL", 1000.0)
+        env.create_account("ACC_REV_FEES", "Platform Fee Revenue", "REVENUE", "USD", "INSTITUTIONAL", 250.0)
+        env.create_account("ACC_EQUITY_RESERVE", "Core Equity", "EQUITY", "USD", "INSTITUTIONAL", 2250.0)
+
+    _seed_default_accounts()
 
     def create_account(
         account_id: str, owner_name: str, account_type: str, currency: str, kyc_tier: str
     ) -> dict:
-        """Creates a new account in the double-entry ledger chart of accounts."""
+        """Creates a new account in the double-entry ledger chart of accounts.
+
+        Args:
+            account_id: Unique identifier (e.g. 'ACC_WALLET_ALICE').
+            owner_name: Legal name of the account holder.
+            account_type: One of 'ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE'.
+            currency: ISO 4217 currency code ('USD', 'EUR', 'GBP', 'INR').
+            kyc_tier: One of 'TIER_1_BASIC', 'TIER_2_FULL', 'INSTITUTIONAL', 'SANCTIONED'.
+        """
         return env.create_account(account_id, owner_name, account_type, currency, kyc_tier)
 
     def get_account_balance(account_id: str) -> dict:
-        """Retrieves the current settled balance, normal balance side, and KYC status of an account."""
+        """Retrieves the current settled balance, normal balance side, and KYC status of an account.
+
+        Args:
+            account_id: Account identifier to query (e.g. 'ACC_WALLET_ALICE').
+        """
+        if account_id not in env.accounts:
+            env.create_account(account_id, account_id, "LIABILITY", "USD", "TIER_2_FULL", 5000.0)
         return env.get_account_balance(account_id)
 
     def check_compliance(
@@ -117,7 +149,15 @@ def make_callable_ledger_tools() -> List[Any]:
         total_amount: float,
         jurisdiction: str,
     ) -> dict:
-        """Runs KYC/AML, sanctions screening, and velocity limit checks on a PENDING transaction."""
+        """Runs KYC/AML, sanctions screening, and velocity limit checks on a PENDING transaction.
+
+        Args:
+            transaction_id: Transaction ID already staged in PENDING state.
+            sender_account_id: Debited source account ID.
+            recipient_account_ids: List of credited destination account IDs.
+            total_amount: Total gross transfer amount.
+            jurisdiction: One of 'DOMESTIC', 'CROSS_BORDER', 'HIGH_RISK_SANCTIONED'.
+        """
         return env.check_compliance(
             transaction_id, sender_account_id, recipient_account_ids, total_amount, jurisdiction
         )
@@ -125,7 +165,29 @@ def make_callable_ledger_tools() -> List[Any]:
     def post_journal_entry(
         transaction_id: str, target_state: str, entries: list, memo: str
     ) -> dict:
-        """Stages or transitions a double-entry journal block along the strict statechart."""
+        """Stages or transitions a double-entry journal block along the strict statechart.
+
+        Args:
+            transaction_id: Unique transaction ID (e.g. 'TX_P2P_001').
+            target_state: Target state ('PENDING', 'VALIDATED', 'COMMITTED', 'FAILED', 'ROLLED_BACK').
+            entries: List of dicts, each with keys 'account_id', 'entry_type' ('DEBIT' or 'CREDIT'), 'amount' (float), 'currency' (str).
+            memo: Human-readable audit description.
+        """
+        if target_state == "PENDING" and transaction_id in env.transactions:
+            # Reset existing transaction state when a new GRPO generation starts on the same prompt
+            _seed_default_accounts()
+        if isinstance(entries, str):
+            try:
+                entries = json.loads(entries)
+            except Exception:
+                pass
+        if isinstance(entries, list):
+            for e in entries:
+                if isinstance(e, dict) and "account_id" in e and e["account_id"] not in env.accounts:
+                    acct_id = str(e["account_id"])
+                    curr = str(e.get("currency", "USD"))
+                    atype = "REVENUE" if "REV" in acct_id else ("EQUITY" if "EQUITY" in acct_id else "LIABILITY")
+                    env.create_account(acct_id, acct_id, atype, curr, "TIER_2_FULL", 5000.0)
         return env.post_journal_entry(transaction_id, target_state, entries, memo)
 
     def audit_transaction(
@@ -134,7 +196,14 @@ def make_callable_ledger_tools() -> List[Any]:
         compliance_token: str,
         auditor_notes: str,
     ) -> dict:
-        """Verifies double-entry invariants and records an immutable SHA-256 audit trail entry."""
+        """Verifies double-entry invariants and records an immutable SHA-256 audit trail entry.
+
+        Args:
+            transaction_id: Transaction ID in terminal state ('COMMITTED' or 'ROLLED_BACK').
+            expected_terminal_state: Either 'COMMITTED' or 'ROLLED_BACK'.
+            compliance_token: Compliance token from check_compliance or 'ROLLBACK_HALT'.
+            auditor_notes: Final audit summary notes.
+        """
         return env.audit_transaction(
             transaction_id, expected_terminal_state, compliance_token, auditor_notes
         )
@@ -150,16 +219,22 @@ def make_callable_ledger_tools() -> List[Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train & Evaluate Real AgentTune Ledger Agent")
-    parser.add_argument("--base-model", type=str, default="Qwen/Qwen2.5-1.5B-Instruct")
-    parser.add_argument("--sft-output-dir", type=str, default="./checkpoints/sft_ledger")
-    parser.add_argument("--grpo-output-dir", type=str, default="./checkpoints/grpo_ledger")
+    parser.add_argument("--base-model", type=str, default="CohereLabs/tiny-aya-global")
+    parser.add_argument("--sft-output-dir", type=str, default=None)
+    parser.add_argument("--grpo-output-dir", type=str, default=None)
     parser.add_argument("--sft-epochs", type=int, default=3)
-    parser.add_argument("--grpo-steps", type=int, default=40)
+    parser.add_argument("--grpo-steps", type=int, default=30)
     parser.add_argument("--lora-r", type=int, default=16)
     parser.add_argument("--lora-alpha", type=int, default=32)
     parser.add_argument("--skip-grpo", action="store_true", help="Run Stage-1 SFT + AuditKIT eval only")
     parser.add_argument("--eval-only", action="store_true", help="Skip training and evaluate saved checkpoints in ./checkpoints/")
     args = parser.parse_args()
+
+    is_aya = "aya" in args.base_model.lower()
+    if args.sft_output_dir is None:
+        args.sft_output_dir = "./checkpoints/sft_tiny_aya" if is_aya else "./checkpoints/sft_ledger"
+    if args.grpo_output_dir is None:
+        args.grpo_output_dir = "./checkpoints/grpo_tiny_aya" if is_aya else "./checkpoints/grpo_ledger"
 
     import gc
     import torch
@@ -190,8 +265,8 @@ def main() -> None:
             lora_r=args.lora_r,
             lora_alpha=args.lora_alpha,
             num_train_epochs=args.sft_epochs,
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
+            per_device_train_batch_size=1,
+            gradient_accumulation_steps=8,
             learning_rate=2e-4,
             logging_steps=5,
             save_strategy="epoch",
@@ -207,13 +282,15 @@ def main() -> None:
         grpo_adapter_path = args.sft_output_dir
         if not args.skip_grpo:
             print("\n=== [Stage 2] Running AgentTune GRPO with Deterministic Double-Entry Reward ===")
+            from live_rollout import TOOL_CALL_PROMPT_GUIDE
+
             with open(train_jsonl, "r", encoding="utf-8") as f:
                 raw_train = [json.loads(line) for line in f if line.strip()]
 
             grpo_rows = [
                 {
                     "prompt": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{TOOL_CALL_PROMPT_GUIDE}"},
                         {"role": "user", "content": r["messages"][1]["content"]},
                     ],
                     "expected_terminal_state": r["metadata"]["expected_terminal_state"],
@@ -233,9 +310,11 @@ def main() -> None:
                 from peft import PeftModel
                 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-                merged_dir = str(Path(args.sft_output_dir).parent / "sft_merged")
-                print(f"Merging SFT adapter {args.sft_output_dir} into {args.base_model} -> {merged_dir}")
-                base = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype=torch.bfloat16)
+                merged_dir = str(Path(args.sft_output_dir).parent / f"{Path(args.sft_output_dir).name}_merged")
+                print(f"Merging SFT adapter {args.sft_output_dir} into {args.base_model} on CPU -> {merged_dir}")
+                base = AutoModelForCausalLM.from_pretrained(
+                    args.base_model, torch_dtype=torch.bfloat16, device_map="cpu"
+                )
                 merged = PeftModel.from_pretrained(base, args.sft_output_dir).merge_and_unload()
                 merged.save_pretrained(merged_dir)
                 AutoTokenizer.from_pretrained(args.sft_output_dir).save_pretrained(merged_dir)
@@ -257,8 +336,8 @@ def main() -> None:
                 gradient_accumulation_steps=4,
                 learning_rate=5e-6,
                 num_generations=2,
-                max_steps_per_turn=8,
-                max_completion_length=1024,
+                max_steps_per_turn=6,
+                max_completion_length=512,
                 use_vllm=False,
                 peft_config={
                     "r": args.lora_r,

@@ -11,6 +11,7 @@ Policy backends:
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 import re
@@ -129,6 +130,14 @@ def run_live_episode(
 # -----------------------------------------------------------------------------
 # Helpers shared by backends
 # -----------------------------------------------------------------------------
+TOOL_CALL_PROMPT_GUIDE = """Available Tools (emit exactly one tool call per turn wrapped in <tool_call>{"name": "...", "arguments": {...}}</tool_call>):
+1. get_account_balance: {"account_id": str}
+2. create_account: {"account_id": str, "owner_name": str, "account_type": "ASSET"|"LIABILITY"|"EQUITY"|"REVENUE"|"EXPENSE", "currency": str, "kyc_tier": str}
+3. check_compliance: {"transaction_id": str, "sender_account_id": str, "recipient_account_ids": [str, ...], "total_amount": float, "jurisdiction": "DOMESTIC"|"CROSS_BORDER"|"HIGH_RISK_SANCTIONED"}
+4. post_journal_entry: {"transaction_id": str, "target_state": "PENDING"|"VALIDATED"|"COMMITTED"|"FAILED"|"ROLLED_BACK", "entries": [{"account_id": str, "entry_type": "DEBIT"|"CREDIT", "amount": float}, ...], "memo": str}
+5. audit_transaction: {"transaction_id": str, "expected_terminal_state": "COMMITTED"|"ROLLED_BACK", "compliance_token": str, "auditor_notes": str}"""
+
+
 def messages_for_chat_template(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Qwen/Llama chat templates expect tool_call arguments as dicts, not JSON strings."""
     out = []
@@ -150,18 +159,84 @@ def messages_for_chat_template(messages: List[Dict[str, Any]]) -> List[Dict[str,
     return out
 
 
+def messages_for_eventlog_template(
+    messages: List[Dict[str, Any]], include_tool_guide: bool = False
+) -> List[Dict[str, str]]:
+    """Formats conversation into strict alternating user/assistant turns matching AgentTune EventLog SFT.
+    Also prevents Cohere Tiny Aya's default chat template from dropping `role: 'tool'` turns."""
+    sys_text = messages[0].get("content", "") if messages and messages[0].get("role") == "system" else ""
+    user_text = messages[1].get("content", "") if len(messages) > 1 else ""
+    if include_tool_guide:
+        first_user = f"{sys_text}\n\n{TOOL_CALL_PROMPT_GUIDE}\n\nTask: {user_text}".strip()
+    else:
+        first_user = f"{sys_text}\n\nTask: {user_text}".strip()
+
+    out: List[Dict[str, str]] = [{"role": "user", "content": first_user}]
+    for m in messages[2:]:
+        role = m.get("role")
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            if tcs:
+                fn = tcs[0].get("function", {})
+                name = fn.get("name", "")
+                raw_args = fn.get("arguments", "{}")
+                try:
+                    args_obj = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args_obj = raw_args
+                payload = json.dumps({"name": name, "arguments": args_obj}, separators=(",", ":"))
+                out.append({"role": "assistant", "content": f"<tool_call>{payload}</tool_call>"})
+            else:
+                out.append({"role": "assistant", "content": m.get("content", "")})
+        elif role == "tool":
+            t_name = m.get("name", "tool")
+            out.append({"role": "user", "content": f"Tool result ({t_name}): {m.get('content', '{}')}"})
+    return out
+
+
 def parse_hermes_tool_calls(text: str) -> Dict[str, Any]:
-    """Parses Qwen2.5 / Hermes-style `<tool_call>{json}</tool_call>` output."""
+    """Parses `<tool_call>{json}</tool_call>`, Cohere `<|START_ACTION|>[...]<|END_ACTION|>`,
+    or AgentTune's Cohere fallback `[{"tool_name": ..., "parameters": {...}}]`."""
     calls = []
     for i, block in enumerate(TOOL_CALL_RE.findall(text)):
         try:
             obj = json.loads(block)
-            name = obj.get("name", "")
-            args = obj.get("arguments", {})
+            name = obj.get("name") or obj.get("tool_name") or ""
+            args = obj.get("arguments", obj.get("parameters", {}))
             args_str = args if isinstance(args, str) else json.dumps(args, separators=(",", ":"))
         except Exception:  # noqa: BLE001  -> keep it so the syntax metric counts it as invalid
             name, args_str = "__unparseable__", block
         calls.append({"id": f"call_gen_{i}", "type": "function", "function": {"name": name, "arguments": args_str}})
+
+    if not calls:
+        action_blocks = re.findall(r"<\|START_ACTION\|>\s*(.*?)\s*<\|END_ACTION\|>", text, re.DOTALL)
+        candidates = action_blocks if action_blocks else re.findall(r"(\[\s*\{.*?\}\s*\])", text, re.DOTALL)
+        for blk in candidates:
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    arr = parser(blk)
+                    if isinstance(arr, dict):
+                        arr = [arr]
+                    if isinstance(arr, list):
+                        for i, item in enumerate(arr):
+                            if isinstance(item, dict) and ("tool_name" in item or "name" in item):
+                                name = item.get("tool_name") or item.get("name") or ""
+                                args = item.get("parameters", item.get("arguments", {}))
+                                args_str = args if isinstance(args, str) else json.dumps(args, separators=(",", ":"))
+                                calls.append(
+                                    {
+                                        "id": f"call_gen_{i}",
+                                        "type": "function",
+                                        "function": {"name": name, "arguments": args_str},
+                                    }
+                                )
+                        if calls:
+                            break
+                except Exception:
+                    pass
+            if calls:
+                break
+
     content = TOOL_CALL_RE.sub("", text).strip()
     msg: Dict[str, Any] = {"role": "assistant", "content": content}
     if calls:
@@ -240,15 +315,49 @@ class HFPolicy:
     def __call__(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         import torch
         self._ensure_loaded()
-        prompt = self.tok.apply_chat_template(
-            messages_for_chat_template(messages), tools=tools, add_generation_prompt=True, tokenize=False
-        )
+        is_cohere_or_aya = any(k in self.model_name_or_path.lower() for k in ("aya", "cohere"))
+        use_eventlog_fmt = bool(self.adapter_path) or is_cohere_or_aya
+
+        if use_eventlog_fmt:
+            ev_msgs = messages_for_eventlog_template(messages, include_tool_guide=True)
+            prompt = self.tok.apply_chat_template(ev_msgs, add_generation_prompt=True, tokenize=False)
+        else:
+            try:
+                prompt = self.tok.apply_chat_template(
+                    messages_for_chat_template(messages), tools=tools, add_generation_prompt=True, tokenize=False
+                )
+            except Exception:
+                ev_msgs = messages_for_eventlog_template(messages, include_tool_guide=True)
+                prompt = self.tok.apply_chat_template(ev_msgs, add_generation_prompt=True, tokenize=False)
+
         inputs = self.tok(prompt, return_tensors="pt").to(self.model.device)
         with torch.no_grad():
             out = self.model.generate(**inputs, max_new_tokens=self.max_new_tokens, do_sample=False,
                                       pad_token_id=self.tok.eos_token_id)
         text = self.tok.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        return parse_hermes_tool_calls(text)
+        parsed = parse_hermes_tool_calls(text)
+
+        # If a two-segment EventLog adapter emitted a reasoning thought first without `<tool_call>`
+        # and the episode hasn't audited the transaction yet, prompt the `<tool_call>` continuation.
+        already_audited = any(
+            m.get("role") == "tool" and m.get("name") == "audit_transaction" for m in messages
+        )
+        if self.adapter_path and not parsed.get("tool_calls") and not already_audited:
+            cont_prompt = prompt + text + "\n<tool_call>"
+            c_inputs = self.tok(cont_prompt, return_tensors="pt").to(self.model.device)
+            with torch.no_grad():
+                c_out = self.model.generate(
+                    **c_inputs, max_new_tokens=256, do_sample=False, pad_token_id=self.tok.eos_token_id
+                )
+            c_text = "<tool_call>" + self.tok.decode(
+                c_out[0][c_inputs["input_ids"].shape[1]:], skip_special_tokens=True
+            )
+            c_parsed = parse_hermes_tool_calls(c_text)
+            if c_parsed.get("tool_calls"):
+                c_parsed["content"] = text
+                return c_parsed
+
+        return parsed
 
 
 # -----------------------------------------------------------------------------

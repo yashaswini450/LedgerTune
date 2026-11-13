@@ -670,7 +670,11 @@ def run_full_auditkit_benchmark(
         sft_name = f"AgentTune-Stage1-SFT-{model_family_label}"
         grpo_name = f"AgentTune-Stage2-GRPO-{model_family_label}"
         column_titles = ("Baseline (`Zero-Shot`)", "AgentTune Stage-1 (`SFT`)", "AgentTune Stage-2 (`SFT + GRPO`)")
-        report_stem = "auditkit_live_gpu_rollout"
+        report_stem = (
+            "auditkit_live_tiny_aya"
+            if "aya" in model_family_label.lower()
+            else "auditkit_live_gpu_rollout"
+        )
     else:
         # Harness sanity check: NO LLM is loaded. These are hand-written policies that
         # replay the teacher trajectory with/without injected faults, used only to verify
