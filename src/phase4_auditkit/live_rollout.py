@@ -191,7 +191,15 @@ def messages_for_eventlog_template(
         elif role == "tool":
             t_name = m.get("name", "tool")
             out.append({"role": "user", "content": f"Tool result ({t_name}): {m.get('content', '{}')}"})
-    return out
+
+    # Guarantee strict user/assistant/user/assistant alternation required by Cohere/Aya Jinja templates
+    merged_out: List[Dict[str, str]] = []
+    for item in out:
+        if merged_out and merged_out[-1]["role"] == item["role"]:
+            merged_out[-1]["content"] = f"{merged_out[-1]['content']}\n{item['content']}"
+        else:
+            merged_out.append(item)
+    return merged_out
 
 
 def parse_hermes_tool_calls(text: str) -> Dict[str, Any]:
@@ -240,7 +248,8 @@ def parse_hermes_tool_calls(text: str) -> Dict[str, Any]:
     content = TOOL_CALL_RE.sub("", text).strip()
     msg: Dict[str, Any] = {"role": "assistant", "content": content}
     if calls:
-        msg["tool_calls"] = calls
+        # Execute one tool call per turn so the agent observes each result before choosing the next step
+        msg["tool_calls"] = calls[:1]
     return msg
 
 
@@ -248,20 +257,26 @@ def parse_hermes_tool_calls(text: str) -> Dict[str, Any]:
 # Backend 1: local HuggingFace model (+ optional LoRA adapter) with lazy load & VRAM cleanup
 # -----------------------------------------------------------------------------
 def _resolve_adapter_dir(adapter_path: Optional[str]) -> Optional[str]:
-    """Resolves adapter directory (or latest checkpoint-* subdirectory if saved by Trainer)."""
+    """Resolves adapter directory (preferring directories that contain actual weight files)."""
     if not adapter_path:
         return None
     p = Path(adapter_path)
     if not p.exists():
         return None
-    if (p / "adapter_config.json").exists() or (p / "config.json").exists():
+    weight_files = ("adapter_model.safetensors", "adapter_model.bin", "model.safetensors", "pytorch_model.bin")
+    if any((p / wf).exists() for wf in weight_files):
         return str(p)
     ckpts = sorted(
         [d for d in p.glob("checkpoint-*") if d.is_dir()],
         key=lambda x: int(x.name.split("-")[-1]) if x.name.split("-")[-1].isdigit() else 0,
     )
+    for ckpt in reversed(ckpts):
+        if any((ckpt / wf).exists() for wf in weight_files):
+            return str(ckpt)
     if ckpts:
         return str(ckpts[-1])
+    if (p / "adapter_config.json").exists() or (p / "config.json").exists():
+        return str(p)
     return None
 
 
@@ -294,7 +309,9 @@ class HFPolicy:
             )
         self.tok = AutoTokenizer.from_pretrained(self.model_name_or_path)
         self.model = AutoModelForCausalLM.from_pretrained(self.model_name_or_path, **kwargs)
-        if self.adapter_path:
+        if self.adapter_path and any(
+            (Path(self.adapter_path) / wf).exists() for wf in ("adapter_model.safetensors", "adapter_model.bin")
+        ):
             from peft import PeftModel
             self.model = PeftModel.from_pretrained(self.model, self.adapter_path)
         self.model.eval()

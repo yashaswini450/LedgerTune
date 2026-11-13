@@ -362,14 +362,17 @@ def main() -> None:
     model_short = args.base_model.split("/")[-1]
     resolved_sft = _resolve_adapter_dir(args.sft_output_dir)
     resolved_grpo = _resolve_adapter_dir(grpo_adapter_path) or resolved_sft
+    merged_sft_dir = Path(args.sft_output_dir).parent / f"{Path(args.sft_output_dir).name}_merged"
+    grpo_base_model = str(merged_sft_dir) if merged_sft_dir.exists() else args.base_model
+
     print(f"  -> Baseline HF Model : {args.base_model}")
     print(f"  -> SFT Adapter Path  : {resolved_sft}")
-    print(f"  -> GRPO Adapter Path : {resolved_grpo}")
+    print(f"  -> GRPO Base + Path  : {grpo_base_model} + {resolved_grpo}")
 
     # `lazy=True` ensures only ONE model is loaded into VRAM at a time and unloaded right after its 25 episodes!
     base_policy = HFPolicy(args.base_model, lazy=True)
     sft_policy = HFPolicy(args.base_model, adapter_path=resolved_sft, lazy=True) if resolved_sft else None
-    grpo_policy = HFPolicy(args.base_model, adapter_path=resolved_grpo, lazy=True) if resolved_grpo else None
+    grpo_policy = HFPolicy(grpo_base_model, adapter_path=resolved_grpo, lazy=True) if resolved_grpo else None
 
     run_full_auditkit_benchmark(
         baseline_policy=base_policy,
