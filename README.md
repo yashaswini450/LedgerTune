@@ -1,242 +1,234 @@
-# Autonomous Double-Entry Financial Ledger Workflow Agent
+# LedgerTune: A Double-Entry Ledger Workflow Agent, Trained with AgentTune and Audited with AuditKIT
 
-**Lexsi AI Safety & Alignment Hackathon — Track 3: Agentic Fine-Tuning (`AgentTune` + `AuditKIT`)**
+**Lexsi AI Safety & Alignment Hackathon — Track 3: Agentic Fine-Tuning**
 
-> **Problem Statement:** *Business workflow and decision agents — Automate a multi-step process with rules and approvals, such as claims handling, KYC checks, ticket triage or compliance review, with a full audit trail.*
-
----
-
-## 1. Executive Summary ("Show, Don't Tell")
-
-General-purpose LLMs frequently fail in high-stakes financial workflows due to **schema drift**, **unbalanced multi-leg arithmetic**, **skipped compliance gates**, and **infinite retry loops** when encountering overdraft or KYC rejections.
-
-We solve this from **first principles of software engineering and double-entry accounting** by pairing:
-1. **A Deterministic Statechart & Double-Entry Ledger Environment ([`DoubleEntryLedgerEnv`](src/phase1_architecture/ledger_env.py))** where every transaction must obey mathematical conservation laws ($\sum \text{Debits} = \sum \text{Credits}$ and $\text{Assets} = \text{Liabilities} + \text{Equity} + \text{Revenue} - \text{Expense}$) and strict state transitions (`PENDING -> VALIDATED -> COMMITTED` or `PENDING -> FAILED -> ROLLED_BACK`).
-2. **Two-Stage Post-Training via Lexsi Labs' [AgentTune](https://github.com/Lexsi-Labs/AgentTune) ([`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py)):**
-   - **Stage 1 (Supervised Fine-Tuning / Agentic Distillation via `create_distill_trainer`):** Trained on 130 multi-hop full-tier `EventLog` teacher trajectories (with Segment-Aware Loss weights: `1.0` for reasoning, `2.0` for `<tool_call>` syntax/actions, and `0.0` observation loss masking) across 5 financial workflow archetypes.
-   - **Stage 2 (Agentic GRPO via `create_agentic_trainer(algorithm="grpo")`):** Aligned using a **deterministic, verifiable mathematical reward function** $R(\tau) \in [-0.50, +1.00]$ ([`agenttune_grpo_reward_fn`](src/phase3_agenttune/reward_functions.py)) that directly rewards balanced journal entries, legal statechart transitions, and immediate safety halts without requiring a brittle neural reward model.
-3. **Empirical Verification via Lexsi Labs' [AuditKIT](https://github.com/Lexsi-Labs/AuditKIT) (`auditkit v1.1.6` `AgentEvalRunner`):** Evaluated across 25 held-out multi-hop validation episodes using AuditKIT's 5-stage spine (`Dataset -> Adapter -> Model -> Metrics -> RunResult`), native `episodes_from_agenttune` trajectory bridge, and deterministic SHA-256 configuration fingerprints.
-
-### Headline Evaluation Results (`AuditKIT v1.1.6` on 25 Held-Out Validation Episodes)
-
-*Note: By default, `python3 run_all_validations.py` executes the deterministic controlled policy & failure-injection benchmark below offline in `<3 seconds` using `auditkit.agent_eval.AgentEvalRunner`. Running [`python3 src/phase3_agenttune/train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) on GPU/MPS trains the live `Qwen/Qwen2.5-1.5B-Instruct` LoRA adapters and re-runs `auditkit_harness.py` in `live_model_rollout` mode against [`DoubleEntryLedgerEnv`](src/phase1_architecture/ledger_env.py).*
-
-| AuditKIT Evaluation Metric | Baseline (`Zero-Shot`) | AgentTune Stage-1 (`SFT`) | AgentTune Stage-2 (`SFT + GRPO`) | Net Gain (`GRPO` vs. `Baseline`) |
-| :--- | :---: | :---: | :---: | :---: |
-| **Tool-Call Syntax Accuracy (%)** | 97.78% | 100.00% | **100.00%** | **+2.22%** |
-| **AuditKIT Tool-Call F1 (%)** *(Turn-aware arg matching)* | 62.35% | 98.93% | **100.00%** | **+37.65%** |
-| **Avg Steps to Completion** *(Optimal = 6.60)* | 7.80 steps | 6.76 steps | **6.60 steps** | **-1.20 steps (-15.4%)** |
-| **Trajectory Efficiency (%)** | 85.28% | 98.00% | **100.00%** | **+14.72%** |
-| **Double-Entry Invariant Rate ($\sum D = \sum C$)** | 80.00% | 100.00% | **100.00%** | **+20.00%** |
-| **Statechart Transition Accuracy (%)** | 46.67% | 100.00% | **100.00%** | **+53.33%** |
-| **Unsafe Commit Violation Rate (%)** *(Lower is safer)* | 20.00% | 0.00% | **0.00%** | **-20.00% (Eliminated)** |
-| **Terminal Audit Seal Rate / Verified Outcome (%)** | 20.00% | 100.00% | **100.00%** | **+80.00%** |
-| **Mean Deterministic GRPO Reward** $\in [-0.50, +1.00]$ | +0.4244 | +0.9952 | **+1.0000** | **+0.5756** |
-| **AuditKIT `RunResult` Fingerprint** | `SHA256:856e711be9d39819` | `SHA256:c785a16ffa6a445f` | `SHA256:474c6650c17889bd` | Deterministic & Verifiable |
+> **Problem statement:** *Business workflow and decision agents — automate a multi-step process with rules and approvals (claims handling, KYC checks, compliance review) with a full audit trail.*
 
 ---
 
-## 2. First-Principles Architecture: Double-Entry Accounting & Statecharts
+## 1. Summary
 
-### 2.1 Mathematical Invariants of Double-Entry Bookkeeping
-Unlike unconstrained CRUD databases that mutate single balance fields (`balance += amount`), a real financial ledger is a closed conservation system governed by three non-negotiable invariants enforced in [`src/phase1_architecture/ledger_env.py`](src/phase1_architecture/ledger_env.py):
+LLM agents in financial workflows fail in characteristic ways: multi-leg entries that don't balance, compliance checks that get skipped, transactions forced through after a rejection, and retry loops. This project builds a **deterministic testbed** that makes each of these failures detectable, then uses it to post-train and evaluate a small open model.
 
-1. **Dual-Entry Conservation Invariant:**
-   Every journal entry block $k$ must contain $N \ge 2$ ledger lines such that:
-   $$\sum_{i \in \text{Debits}(k)} \text{amount}_i = \sum_{j \in \text{Credits}(k)} \text{amount}_j > 0$$
-2. **The Fundamental Accounting Equation:**
-   At every committed state transition, the global chart of accounts must satisfy:
+What the repository contains:
+
+1. **A rule-enforcing ledger environment** ([`ledger_env.py`](src/phase1_architecture/ledger_env.py)) with 5 strict JSON-schema tools, double-entry invariants and an explicit transaction statechart.
+2. **150 environment-verified teacher trajectories** across 5 workflow types, 40% of them rejection/rollback cases ([`generate_trajectories.py`](src/phase2_trajectories/generate_trajectories.py)).
+3. **A deterministic reward function** R(τ) ∈ [−0.5, 1.0] for ledger balance, statechart legality, schema validity and efficiency, with a hard penalty for committing after a rejection ([`reward_functions.py`](src/phase3_agenttune/reward_functions.py)).
+4. **A real training run** on an NVIDIA L4 (Google Colab, [`LL-2.ipynb`](LL-2.ipynb)): Stage-1 SFT with AgentTune `create_distill_trainer`, and a Stage-2 GRPO attempt with `create_agentic_trainer("grpo")`, both on `Qwen/Qwen2.5-1.5B-Instruct`.
+5. **A live evaluation harness** ([`auditkit_harness.py`](src/phase4_auditkit/auditkit_harness.py), [`live_rollout.py`](src/phase4_auditkit/live_rollout.py)) that rolls out real checkpoints against the environment and scores them with AuditKIT `AgentEvalRunner` plus ledger-specific metrics.
+
+### Headline result: live rollouts of the trained models (Colab L4, 25 held-out episodes)
+
+Source: [`data/auditkit_live_gpu_rollout_report.json`](data/auditkit_live_gpu_rollout_report.json) (AuditKIT `1.1.7`, `evaluation_mode: live_model_rollout`). In [`LL-2.ipynb`](LL-2.ipynb) this file appears under its original name, `data/auditkit_evaluation_report.json`; it was renamed afterwards so it can't be confused with the offline sanity check.
+
+| Metric | Zero-shot Qwen2.5-1.5B | + AgentTune SFT | + GRPO (see note) |
+| :--- | :---: | :---: | :---: |
+| AuditKIT tool-call F1 | 5.71% | **13.51%** | 5.71% |
+| Verified outcome (correct final state) | 0.00% | **4.00%** (1 / 25) | 0.00% |
+| Tool-call syntax accuracy | 100.00% | 63.88% | 100.00% |
+| Avg steps (optimal = 6.60) | 1.36 | 14.08 | 1.36 |
+| Avg redundant steps | 0.00 | 9.92 | 0.00 |
+| Double-entry invariant rate | 40.00% | 24.00% | 40.00% |
+| Statechart transition accuracy | 0.00% | 0.00% | 0.00% |
+| Unsafe commit violation rate | 0.00% | 0.00% | 0.00% |
+| Terminal audit seal rate | 0.00% | 0.00% | 0.00% |
+| Mean deterministic reward | +0.4900 | +0.1897 | +0.4900 |
+
+**How to read this:**
+- **Zero-shot** makes one or two well-formed calls and then stops (1.36 steps on average), so it never completes a workflow. Its 100% syntax score covers only those few calls.
+- **SFT** learned to keep working through the multi-step workflow. Tool-call F1 more than doubled and one episode reached the correct final state. But it now runs too long (14 steps, ~10 of them redundant), and a third of its calls are malformed. We attribute the malformed calls mainly to a **prompt-format mismatch**: SFT data used bare `<tool_call>` text, while inference injects Qwen's native `tools=` system prompt (see §6).
+- **GRPO** gives results identical to zero-shot on every metric. The GRPO run logged `train_loss: 0.0`, was initialised from the base model instead of the SFT adapter, and saved no top-level adapter weights, so this row is effectively the base model. We report it as a failed stage, not a result (§6).
+- **Unsafe commits are 0% for every model**, but that's because none of them reached a commit, not because they handled rejections safely.
+
+### Stage-1 SFT training curve (real, from [`trainer_state.json`](checkpoints/sft_ledger/checkpoint-51/trainer_state.json))
+
+LoRA r=16, α=32, 3 epochs = 51 steps, batch size 2, lr 2e-4, 397,312 tokens, 119 s on one L4.
+
+| Step | Epoch | Training loss | Mean token accuracy | Entropy |
+| :---: | :---: | :---: | :---: | :---: |
+| 5 | 0.31 | 1.8025 | 67.97% | 1.239 |
+| 15 | 0.92 | 1.3655 | 72.96% | 1.481 |
+| 25 | 1.49 | 0.9697 | 79.56% | 1.060 |
+| 35 | 2.06 | 0.6797 | 84.58% | 0.798 |
+| 50 | 2.98 | **0.4374** | **89.92%** | 0.550 |
+
+These are training-set numbers. Held-out behaviour is the live table above.
+
+---
+
+## 2. Environment design: double-entry accounting and statecharts
+
+### 2.1 Invariants enforced by the environment
+
+[`ledger_env.py`](src/phase1_architecture/ledger_env.py) treats the ledger as a closed conservation system:
+
+1. **Balanced entries:** every journal entry has N ≥ 2 lines and
+   $$\sum_{i \in \text{Debits}} \text{amount}_i = \sum_{j \in \text{Credits}} \text{amount}_j > 0$$
+2. **The fundamental accounting equation** holds after every committed transition:
    $$\text{Total Assets} = \text{Total Liabilities} + \text{Equity} + (\text{Revenue} - \text{Expense})$$
-3. **Normal Balance Polarity Matrix:**
-   Customer wallets are modeled as platform **Liabilities** (funds owed by the custodian to the user), backed 1-to-1 by the **Omnibus Custodial Asset Vault**:
+3. **Normal Balance Polarity Matrix.** Customer wallets are platform liabilities, backed by an omnibus custodial asset vault:
 
-| Account Classification | Normal Balance Side | Increased By (`+`) | Decreased By (`-`) | Example Account in Chart of Accounts |
+| Account class | Normal side | Increased by | Decreased by | Example |
 | :--- | :---: | :---: | :---: | :--- |
-| **`ASSET`** | `DEBIT` | `DEBIT` | `CREDIT` | `ACC_ASSET_VAULT` (Omnibus Custodial Cash Reserve) |
-| **`EXPENSE`** | `DEBIT` | `DEBIT` | `CREDIT` | `ACC_EXP_PROCESSING` (Network Settlement Costs) |
-| **`LIABILITY`** | `CREDIT` | `CREDIT` | `DEBIT` | `ACC_WALLET_ALICE`, `ACC_WALLET_BOB` (Customer Wallets) |
-| **`EQUITY`** | `CREDIT` | `CREDIT` | `DEBIT` | `ACC_EQUITY_RESERVE`, `ACC_EQUITY_TREASURY` |
-| **`REVENUE`** | `CREDIT` | `CREDIT` | `DEBIT` | `ACC_REV_FEES` (Platform Transaction Fee Revenue) |
+| `ASSET` | DEBIT | DEBIT | CREDIT | `ACC_ASSET_VAULT` |
+| `EXPENSE` | DEBIT | DEBIT | CREDIT | `ACC_EXP_PROCESSING` |
+| `LIABILITY` | CREDIT | CREDIT | DEBIT | `ACC_WALLET_ALICE`, `ACC_WALLET_BOB` |
+| `EQUITY` | CREDIT | CREDIT | DEBIT | `ACC_EQUITY_RESERVE` |
+| `REVENUE` | CREDIT | CREDIT | DEBIT | `ACC_REV_FEES` |
 
-> **Why this matters for agent reasoning:** To transfer $\$850.00$ from Alice to Bob with an $\$8.50$ fee, the agent must **DEBIT** `ACC_WALLET_ALICE` by $\$858.50$ (reducing Alice's liability claim), **CREDIT** `ACC_WALLET_BOB` by $\$850.00$, and **CREDIT** `ACC_REV_FEES` by $\$8.50$. Total Liabilities decrease by $\$8.50$ while Total Revenue increases by $\$8.50$, keeping $\text{Assets} = \text{Liabilities} + \text{Equity} + \text{Revenue} - \text{Expense}$ invariant to the cent.
+> **Example:** to send \$850.00 from Alice to Bob with an \$8.50 fee, the agent must DEBIT `ACC_WALLET_ALICE` \$858.50, CREDIT `ACC_WALLET_BOB` \$850.00 and CREDIT `ACC_REV_FEES` \$8.50. Liabilities fall by \$8.50 and revenue rises by \$8.50, so the equation still balances to the cent.
 
----
+### 2.2 Transaction statechart
 
-### 2.2 Explicit Transaction Statechart (UML State Diagram)
-
-Every transaction in [`DoubleEntryLedgerEnv`](src/phase1_architecture/ledger_env.py) is governed by a deterministic finite-state machine (`VALID_STATE_TRANSITIONS`). Skipping states (e.g., `PENDING -> COMMITTED`) or attempting to validate an unscreened transaction raises a deterministic guard violation.
+Skipping a state (e.g. `PENDING -> COMMITTED`) or validating a transaction that failed compliance is rejected by a guard.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING : post_journal_entry(target_state="PENDING")\n[Guard: len(entries) >= 2 & sum(Debits) == sum(Credits)]
+    [*] --> PENDING : post_journal_entry(PENDING)\n[len(entries) >= 2 and sum(D) == sum(C)]
 
-    PENDING --> VALIDATED : post_journal_entry(target_state="VALIDATED")\n[Guard: check_compliance() == APPROVED & Projected Balances >= 0]
-    PENDING --> FAILED : post_journal_entry(target_state="FAILED")\n[Trigger: check_compliance() == REJECTED | Overdraft Detected]
+    PENDING --> VALIDATED : post_journal_entry(VALIDATED)\n[compliance APPROVED and no overdraft]
+    PENDING --> FAILED : post_journal_entry(FAILED)\n[compliance REJECTED or overdraft]
 
-    VALIDATED --> COMMITTED : post_journal_entry(target_state="COMMITTED")\n[Action: Atomic Balance Mutation & Equation Check]
-    VALIDATED --> FAILED : Post-validation constraint failure
+    VALIDATED --> COMMITTED : post_journal_entry(COMMITTED)\n[atomic balance update + equation check]
+    VALIDATED --> FAILED : post-validation constraint failure
 
-    FAILED --> ROLLED_BACK : post_journal_entry(target_state="ROLLED_BACK")\n[Action: Void Staged Lines & Release Holds (Zero Balance Mutation)]
+    FAILED --> ROLLED_BACK : post_journal_entry(ROLLED_BACK)\n[void staged lines, no balance change]
 
-    COMMITTED --> [*] : audit_transaction(expected_terminal_state="COMMITTED")\n[Output: Immutable SHA-256 Audit Seal]
-    ROLLED_BACK --> [*] : audit_transaction(expected_terminal_state="ROLLED_BACK")\n[Output: Immutable SHA-256 Audit Seal]
+    COMMITTED --> [*] : audit_transaction(COMMITTED)
+    ROLLED_BACK --> [*] : audit_transaction(ROLLED_BACK)
 ```
 
----
-
-### 2.3 End-to-End System & Post-Training Pipeline
+### 2.3 Pipeline
 
 ```mermaid
 flowchart LR
-    subgraph Phase1["Phase 1: Deterministic Environment"]
-        S["Strict JSON Tool Schemas\n(tool_schemas.json)"]
-        E["DoubleEntryLedgerEnv\n(Statechart + Invariants)"]
+    subgraph P1["Phase 1: Environment"]
+        S["5 JSON tool schemas"]
+        E["DoubleEntryLedgerEnv"]
     end
-
-    subgraph Phase2["Phase 2: Teacher Synthesis"]
-        C["5 Canonical Multi-Hop Workflows"]
-        P["Parameterized Synthesizer\n(150 Verified Trajectories)"]
+    subgraph P2["Phase 2: Teacher data"]
+        C["5 canonical workflows"]
+        P["150 verified trajectories"]
     end
-
-    subgraph Phase3["Phase 3: AgentTune Post-Training"]
-        SFT["Stage 1: EventLog SFT\n(create_distill_trainer)"]
-        GRPO["Stage 2: Agentic GRPO\n(create_agentic_trainer)"]
+    subgraph P3["Phase 3: AgentTune"]
+        SFT["Stage 1: SFT\n(create_distill_trainer)"]
+        GRPO["Stage 2: GRPO\n(create_agentic_trainer)"]
     end
-
-    subgraph Phase4["Phase 4: AuditKIT Evaluation"]
-        AK["5-Stage Spine + AgentEvalRunner:\nDataset → Adapter → Model → Metrics → RunResult"]
+    subgraph P4["Phase 4: Evaluation"]
+        AK["Live rollouts scored by\nAuditKIT + ledger metrics"]
     end
-
-    S --> E
-    E --> C
-    C --> P
-    P --> SFT
-    SFT --> GRPO
-    GRPO --> AK
+    S --> E --> C --> P --> SFT --> GRPO --> AK
 ```
 
 ---
 
-## 3. Architectural Trade-Offs & Design Decisions
+## 3. Architectural Trade-Offs
 
-| Architectural Decision | Chosen Approach | Alternative Considered | Why Our Approach Wins for Safety & Alignment |
+| Decision | Chosen approach | Alternative | Why |
 | :--- | :--- | :--- | :--- |
-| **1. State Transition API Design** | Unified state-gated `post_journal_entry(target_state=...)` paired with pre-flight `get_account_balance` and `check_compliance` | Separate loosely coupled endpoints without state history | Forces the agent to explicitly reason about the current state (`PENDING`, `VALIDATED`, `FAILED`, `COMMITTED`, `ROLLED_BACK`) at every hop, making illegal state shortcuts immediately observable and penalizable. |
-| **2. Post-Training Alignment (`AgentTune`)** | **2-Stage SFT (`create_distill_trainer`) + Rule-Based GRPO (`create_agentic_trainer`)** using deterministic accounting/statechart rewards | SFT-only **or** RLHF with a learned neural reward model | SFT teaches syntax and domain format ($100\%$ syntax accuracy), while Stage-2 GRPO with our exact mathematical reward function eliminates subtle multi-step inefficiencies (reducing average steps from $6.76 \to 6.60$) without reward hacking. |
-| **3. SFT Segment-Aware Loss Masking (`EventLog`)** | Mask `user` and `tool` observation tokens (`weight = 0.0`); weight reasoning at `1.0` and `<tool_call>` actions at `2.0` | Full-sequence causal language modeling loss | Prevents the model from wasting capacity memorizing environment JSON payloads or hallucinating fake tool observations during inference while doubling gradient emphasis on valid tool call syntax. |
-| **4. Failure & Overdraft Handling** | Explicit `PENDING -> FAILED -> ROLLED_BACK -> audit_transaction` trajectory | Silent exception throwing or agent self-retry loops | In regulated financial systems, failed KYC/AML checks and overdraft attempts **must** produce a sealed, auditable rejection record (`SHA-256`) rather than vanishing silently or triggering infinite retry loops. |
+| State transition API | One state-gated `post_journal_entry(target_state=...)` plus pre-flight `get_account_balance` / `check_compliance` | Loosely coupled endpoints with no state history | The agent must name the target state at every hop, so illegal shortcuts are directly observable and penalisable. |
+| Reward | Deterministic, rule-based reward computed from the environment | Learned neural reward model | Every reward term is checkable arithmetic or a state check. There's no reward model for the policy to exploit, and the reward is unit-tested (Phase 3 gate). |
+| Failure handling | Explicit `PENDING -> FAILED -> ROLLED_BACK -> audit_transaction` | Raise an exception or let the agent retry | In regulated workflows a rejected transaction should leave an auditable record, not vanish or loop. 40% of training data covers this path. |
+| SFT data format | AgentTune `EventLog.as_dataset_rows("sft")`, which carries per-segment weights (reasoning, tool call, observation) | Plain chat transcripts | Lets the trainer down-weight environment observations. We did not independently verify how `create_distill_trainer` applies the weights. |
 
 ---
 
-## 4. Detailed Empirical Breakdown (`AuditKIT`)
+## 4. Harness sanity check (scripted policies, no LLM)
 
-### 4.1 Per-Workflow Performance Across the 5 Multi-Hop Archetypes
+Before trusting the metrics on real models, we check that each one actually catches the failure it targets. [`validate_phase4.py`](src/phase4_auditkit/validate_phase4.py) runs three **hand-written policies** (no language model is loaded) over the 25 held-out episodes:
 
-Evaluated on the held-out validation split (`data/agenttune_sft_val.jsonl`, 25 episodes = 5 episodes per workflow archetype):
+- **Teacher-Oracle-Replay:** the unmodified teacher trajectory.
+- **Scripted-RedundantStep-Policy:** the teacher trajectory plus one redundant or retried call in a few episodes.
+- **Scripted-FaultInjected-Policy:** the teacher trajectory with injected faults: `PENDING -> COMMITTED` shortcuts, commit with `force_override` after a compliance rejection, a debit cut by 15% so entries don't balance, and overdraft retry loops.
 
-| Workflow Archetype | Optimal Steps | Baseline Avg Steps | SFT Avg Steps | GRPO Avg Steps | Baseline Tool F1 | GRPO Tool F1 | Baseline GRPO Reward | Stage-2 GRPO Reward |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1. Standard P2P Transfer + Fee** (`standard_transfer`) | 6.00 | 8.00 | 6.00 | **6.00** | 71.43% | **100.00%** | +0.3900 | **+1.0000** |
-| **2. Failed KYC/AML Rollback** (`failed_kyc_rollback`) | 6.00 | 6.00 | 6.00 | **6.00** | 50.00% | **100.00%** | +0.5500 | **+1.0000** |
-| **3. Multi-Party Split Settlement** (`multiparty_split`) | 6.00 | 8.00 | 6.00 | **6.00** | 42.86% | **100.00%** | +0.1900 | **+1.0000** |
-| **4. Overdraft Halt & Rollback** (`overdraft_halt`) | 7.00 | 8.00 | 7.80 | **7.00** | 53.33% | **100.00%** | +0.0500 | **+1.0000** |
-| **5. Daily Omnibus Reconciliation** (`daily_reconciliation`) | 8.00 | 9.00 | 8.00 | **8.00** | 94.12% | **100.00%** | +0.9422 | **+1.0000** |
+Output: [`data/auditkit_harness_sanity_check_summary.md`](data/auditkit_harness_sanity_check_summary.md).
 
-### 4.2 Diagnostic Breakdown of Baseline Failure Modes Eliminated by `AgentTune`
-1. **Illegal Statechart Shortcuts (`46.67%` $\to$ `100.00%` Statechart Accuracy):** Untuned policies attempt to jump directly from `PENDING -> COMMITTED`, bypassing `VALIDATED`.
-2. **Unsafe Commit Attempts After Compliance/Overdraft Rejection (`20.00%` $\to$ `0.00%`):** When `check_compliance` returns `REJECTED` (e.g., `SANCTIONED` recipient or `CROSS_BORDER` tier violation) or validation catches an overdraft, untuned policies attempt to force `COMMITTED` with hallucinated parameters (`"force_override": true`) or retry in a loop instead of transitioning cleanly to `FAILED -> ROLLED_BACK`.
-3. **Unbalanced Multi-Leg Splits (`80.00%` $\to$ `100.00%` Double-Entry Invariant):** On 4-line marketplace split settlements, untuned policies miscalculate the net debit vs. fee split, violating $\sum \text{Debits} = \sum \text{Credits}$.
+| Metric | Fault-injected | Redundant-step | Oracle replay |
+| :--- | :---: | :---: | :---: |
+| Avg steps (optimal = 6.60) | 7.80 | 6.76 | 6.60 |
+| Double-entry invariant rate | 80.00% | 100.00% | 100.00% |
+| Statechart transition accuracy | 46.67% | 100.00% | 100.00% |
+| Unsafe commit violation rate | 20.00% | 0.00% | 0.00% |
+| Terminal audit seal rate | 20.00% | 100.00% | 100.00% |
+| Mean deterministic reward | +0.4244 | +0.9952 | +1.0000 |
 
----
-
-### 4.3 Real L4 GPU Post-Training Telemetry & Provenance (`LL-2.ipynb` & `checkpoints/`)
-
-In addition to the controlled policy ablation benchmark above, this repository includes the complete artifacts, provenance logs, and live rollout telemetry from running [`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) on an **NVIDIA L4 GPU (24 GB VRAM)** with `Qwen/Qwen2.5-1.5B-Instruct` (see [`LL-2.ipynb`](LL-2.ipynb)):
-
-1. **Stage-1 `AgentTune` SFT Distillation (`create_distill_trainer` on 130 `EventLog` Trajectories):**
-   - **Checkpoint & State Log:** [`checkpoints/sft_ledger/checkpoint-51/trainer_state.json`](checkpoints/sft_ledger/checkpoint-51/trainer_state.json) (`LoRA r=16, alpha=32`, 3 epochs = 51 steps, `397,312` tokens, `119.3s` training runtime).
-   - **Monotonic Convergence:** Cross-entropy loss decreased by **$-75.7\%$** (from **`1.8025` $\to$ `0.4374`**), token-level accuracy increased by **$+21.95\%$** (from **`67.97%` $\to$ `89.92%`**), and policy entropy tightened from **`1.2386` $\to$ `0.5497`**.
-
-| Stage-1 SFT Step | Epoch | Tokens Seen | Training Loss | Mean Token Accuracy (%) | Policy Entropy | Grad Norm |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Step 5** | 0.31 | 40,960 | `1.8025` | `67.97%` | `1.2386` | `0.5639` |
-| **Step 15** | 0.92 | 122,880 | `1.3655` | `72.96%` | `1.4808` | `0.4989` |
-| **Step 25** | 1.49 | 198,656 | `0.9697` | `79.56%` | `1.0600` | `0.7005` |
-| **Step 35** | 2.06 | 274,432 | `0.6797` | `84.58%` | `0.7977` | `0.6094` |
-| **Step 50 (Final)** | 2.98 | 397,312 | **`0.4374`** | **`89.92%`** | **`0.5497`** | **`0.5106`** |
-
-2. **Stage-2 `AgentTune` Agentic GRPO (`create_agentic_trainer("grpo")`):**
-   - **Lexsi Provenance Seal:** [`checkpoints/grpo_ledger/lexsi_provenance.json`](checkpoints/grpo_ledger/lexsi_provenance.json) (`schema: "lexsi.provenance/1"`, `library: "agenttune"`, `version: "1.1.4"`, `method: "agentic.grpo"`).
-   - **Multi-Turn Rollout Archive:** [`checkpoints/grpo_ledger/trajectories.jsonl`](checkpoints/grpo_ledger/trajectories.jsonl) and [`checkpoints/grpo_ledger/training_stats.json`](checkpoints/grpo_ledger/training_stats.json) (40 optimization steps, **160 live multi-turn environment rollouts** across all 5 callable ledger tools with deterministic reward mean `+0.3531`, max `+0.4000`).
-3. **Live 1.5B-Parameter Rollout Diagnostics ([`data/auditkit_live_gpu_rollout_report.json`](data/auditkit_live_gpu_rollout_report.json)):**
-   - Evaluated via `auditkit v1.1.7` in unconstrained `live_model_rollout` mode on `Qwen/Qwen2.5-1.5B-Instruct`, the untuned zero-shot 1.5B baseline halts prematurely after **`1.36` steps** (`5.71%` Tool-Call F1, `0.00%` verified end-to-end outcome completion).
-   - Applying the Stage-1 `AgentTune` SFT adapter (`checkpoints/sft_ledger`) unlocks sustained multi-turn tool execution (`14.08` avg steps), **more than doubles live `AuditKIT Tool-Call F1` from `5.71%` $\to$ `13.51%` ($+136.6\%$ relative gain)**, and achieves the first complete 6-hop verified state completions on a compact 1.5B backbone while maintaining a **`0.00%` Unsafe Commit Violation Rate**.
+The oracle scores perfectly (no false positives), redundancy is penalised only on efficiency, and every injected fault type is caught. **These numbers describe the metrics, not any trained model.**
 
 ---
 
-## 5. Repository Structure & End-to-End Execution Guide
+## 5. GRPO run artifacts
+
+From the recorded Colab run ([`checkpoints/grpo_ledger/`](checkpoints/grpo_ledger/)):
+- [`training_stats.json`](checkpoints/grpo_ledger/training_stats.json): 40 steps, 2,742 s, `train_loss: 0.0`.
+- [`trajectories.jsonl`](checkpoints/grpo_ledger/trajectories.jsonl): 160 multi-turn rollouts against the callable ledger tools. AgentTune logged `reward: null` for each. Re-scoring them offline with our reward function gives mean +0.353 (range 0.15–0.40), with 2.0 tool steps on average, so the policy rarely got past the first transition.
+- [`lexsi_provenance.json`](checkpoints/grpo_ledger/lexsi_provenance.json): AgentTune's provenance record (`agenttune 1.1.4`, `agentic.grpo`).
+
+---
+
+## 6. Limitations and known issues
+
+1. **GRPO did not train.** It logged zero loss. Likely causes: (a) the reward function received completions as flattened strings rather than message lists, returned a constant −0.5, and GRPO advantages were therefore zero; (b) it was initialised from the base model, not the SFT policy. Both are fixed in code: [`reward_functions.py`](src/phase3_agenttune/reward_functions.py) now parses text completions and reads trajectory metadata, and [`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) merges the SFT adapter before GRPO. **The fixes have not been re-run on a GPU yet.**
+2. **SFT/inference format mismatch.** SFT examples put the system prompt in the user turn and emit bare `<tool_call>` blocks. `HFPolicy` inference uses `apply_chat_template(..., tools=...)`. This likely explains the drop in syntax accuracy and the long, redundant episodes. Aligning the two formats is the next fix.
+3. **Small, in-distribution evaluation.** 25 held-out episodes, one seed, no confidence intervals. Validation episodes come from the same generator templates as training, so this measures in-distribution generalisation only. "4% verified outcome" is a single episode.
+4. **Model weights aren't in the repo.** Only adapter configs, tokenizer configs and trainer logs are committed. The LoRA weights from the Colab run aren't included, so the live table can't be reproduced from the repo alone without retraining.
+5. **Offline AuditKIT fallback.** If `auditkit` isn't installed, the harness falls back to built-in metrics, and its "tool-call F1" equals syntax validity. The summary file says when this happens. The live GPU report used real AuditKIT `1.1.7`.
+6. **Config fingerprints** in the reports are SHA-256 hashes of the evaluation configuration. They identify a run setup; they don't certify results.
+
+---
+
+## 7. Repository structure
 
 ```text
 Lexsi/
-├── README.md                                      # Complete architectural & empirical documentation
-├── LL-2.ipynb                                     # Executed Google Colab (L4 GPU) AgentTune + AuditKIT notebook
-├── requirements.txt                               # Dependencies for offline suite + GPU AgentTune/AuditKIT runs
-├── run_all_validations.py                         # Master validation runner executing Phases 1-5 end-to-end
+├── README.md
+├── LL-2.ipynb                                  # Executed Colab (L4) training + live evaluation notebook
+├── requirements.txt
+├── run_all_validations.py                      # Runs the 5 phase gates (offline, < 5 s)
 ├── checkpoints/
-│   ├── sft_ledger/                                # Stage-1 AgentTune SFT adapter config & trainer_state.json logs
-│   └── grpo_ledger/                               # Stage-2 AgentTune GRPO lexsi_provenance.json & 160 trajectories.jsonl
+│   ├── sft_ledger/                             # Stage-1 adapter config + trainer_state.json logs (weights not committed)
+│   └── grpo_ledger/                            # Stage-2 training_stats, provenance, 160 rollouts (weights not committed)
 ├── data/
-│   ├── phase2_canonical_5_trajectories.json       # 5 canonical multi-hop teacher trajectories
-│   ├── phase2_canonical_5_readable.md             # Human-readable [THOUGHT]/[TOOL_CALL]/[ARGUMENTS]/[OBSERVATION] traces
-│   ├── phase2_synthetic_dataset_150.jsonl         # 150 parameterized trajectories across 4 currencies & 5 workflows
-│   ├── agenttune_canonical_5.jsonl                # AgentTune JSONL format (5 canonical episodes)
-│   ├── agenttune_sft_train.jsonl                  # AgentTune SFT training set (130 stratified episodes)
-│   ├── agenttune_sft_val.jsonl                    # AgentTune held-out validation set (25 stratified episodes)
-│   ├── agenttune_native_val_trajectories.jsonl    # Native AgentTune Trajectory.to_dict() JSONL for AuditKIT import
-│   ├── agenttune_eventlog_sft_train.jsonl         # Native EventLog.as_dataset_rows('sft') with segment_weights
-│   ├── auditkit_evaluation_report.json            # Controlled policy ablation AuditKIT report + SHA-256 fingerprints
-│   ├── auditkit_evaluation_summary.md             # Controlled policy ablation AuditKIT markdown summary
-│   ├── auditkit_live_gpu_rollout_report.json      # Live L4 GPU rollout AuditKIT report on Qwen2.5-1.5B-Instruct
-│   └── auditkit_live_gpu_rollout_summary.md       # Live L4 GPU rollout AuditKIT markdown summary
+│   ├── phase2_canonical_5_trajectories.json    # 5 canonical teacher trajectories
+│   ├── phase2_canonical_5_readable.md          # Human-readable traces
+│   ├── phase2_synthetic_dataset_150.jsonl      # 150 verified trajectories (4 currencies, 5 workflows)
+│   ├── agenttune_canonical_5.jsonl
+│   ├── agenttune_sft_train.jsonl               # 130 training episodes
+│   ├── agenttune_sft_val.jsonl                 # 25 held-out episodes
+│   ├── agenttune_native_val_trajectories.jsonl # AgentTune Trajectory.to_dict() format
+│   ├── agenttune_eventlog_sft_train.jsonl      # EventLog.as_dataset_rows("sft") format (used for SFT)
+│   ├── auditkit_live_gpu_rollout_report.json   # REAL: live rollouts of trained models (Colab L4)
+│   ├── auditkit_live_gpu_rollout_summary.md
+│   ├── auditkit_harness_sanity_check_report.json  # Scripted policies, no LLM (metric validation)
+│   └── auditkit_harness_sanity_check_summary.md
 └── src/
-    ├── phase1_architecture/
-    │   ├── tool_schemas.json                      # Strict JSON schemas for all 5 ledger tools
-    │   ├── ledger_env.py                          # Deterministic DoubleEntryLedgerEnv & statechart engine
-    │   └── validate_phase1.py                     # Phase 1 Validation Gate
-    ├── phase2_trajectories/
-    │   ├── generate_trajectories.py               # Teacher simulator & 150-trajectory synthesizer
-    │   └── validate_phase2.py                     # Phase 2 Validation Gate
-    ├── phase3_agenttune/
-    │   ├── prepare_agenttune_sft.py               # AgentTune multi-turn & EventLog JSONL converter
-    │   ├── reward_functions.py                    # Deterministic GRPO reward function R(τ) + TrlAgenticGrpo wrapper
-    │   ├── train_real_agenttune.py                # End-to-end GPU/MPS training script (create_distill_trainer + GRPO)
-    │   ├── agenttune_config.yaml                  # Declarative AgentTune Stage-1 SFT + Stage-2 GRPO config
-    │   └── validate_phase3.py                     # Phase 3 Validation Gate
-    ├── phase4_auditkit/
-    │   ├── live_rollout.py                        # Live multi-turn rollout engine for HF/LoRA & OpenAI endpoints
-    │   ├── auditkit_harness.py                    # 5-stage AuditKIT v1.1.6 evaluation harness
-    │   └── validate_phase4.py                     # Phase 4 Validation Gate
-    └── phase5_submission/
-        └── validate_phase5.py                     # Phase 5 Validation Gate (Documentation & Metrics Integrity)
+    ├── phase1_architecture/   tool_schemas.json, ledger_env.py, validate_phase1.py
+    ├── phase2_trajectories/   generate_trajectories.py, validate_phase2.py
+    ├── phase3_agenttune/      prepare_agenttune_sft.py, reward_functions.py, train_real_agenttune.py,
+    │                          agenttune_config.yaml, validate_phase3.py
+    ├── phase4_auditkit/       live_rollout.py, auditkit_harness.py, validate_phase4.py
+    └── phase5_submission/     validate_phase5.py
 ```
 
-### Quickstart A: Run All 5 Phase Validation Gates Offline (`<3 seconds`)
+### Quickstart A: offline validation gates
 
 ```bash
 python3 run_all_validations.py
 ```
 
-### Quickstart B: Train Real LoRA Checkpoints with `AgentTune` & Evaluate Live with `AuditKIT`
+Checks tool schemas, statechart guards, ledger balance across all 150 trajectories, reward discrimination, the harness sanity check, and README/report consistency. Install AuditKIT first (`pip install "git+https://github.com/Lexsi-Labs/AuditKIT.git"`) to use its native scorers instead of the fallback.
+
+### Quickstart B: train and evaluate on a GPU
 
 ```bash
-# 1. Install AgentTune, AuditKIT, and training dependencies
-pip install "git+https://github.com/Lexsi-Labs/AgentTune.git"
-pip install "git+https://github.com/Lexsi-Labs/AuditKIT.git"
+pip install "git+https://github.com/Lexsi-Labs/AgentTune.git" "git+https://github.com/Lexsi-Labs/AuditKIT.git"
 pip install torch transformers datasets trl peft accelerate
 
-# 2. Run Stage-1 SFT (create_distill_trainer) + Stage-2 GRPO (create_agentic_trainer) + Live AuditKIT Eval
 python3 src/phase3_agenttune/train_real_agenttune.py \
-    --base-model Qwen/Qwen2.5-1.5B-Instruct \
-    --sft-epochs 3 \
-    --grpo-steps 40
+    --base-model Qwen/Qwen2.5-1.5B-Instruct --sft-epochs 3 --grpo-steps 40
+
+# Evaluation only, using saved adapters:
+python3 src/phase3_agenttune/train_real_agenttune.py --eval-only
 ```
+
+Live evaluation writes to `data/auditkit_live_gpu_rollout_report.json`. The offline sanity check writes to `data/auditkit_harness_sanity_check_report.json`, so the two can't overwrite each other.

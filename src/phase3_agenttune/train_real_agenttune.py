@@ -223,9 +223,31 @@ def main() -> None:
             ]
             grpo_dataset = Dataset.from_list(grpo_rows)
 
+            # Start GRPO from the SFT policy, not the raw base model: merge the Stage-1 LoRA
+            # adapter into the base weights and hand the merged checkpoint to GRPO.
+            # (The first Colab run initialised GRPO from args.base_model, so Stage 2 did not
+            # build on Stage 1.)
+            grpo_init_model = args.base_model
+            try:
+                import torch
+                from peft import PeftModel
+                from transformers import AutoModelForCausalLM, AutoTokenizer
+
+                merged_dir = str(Path(args.sft_output_dir).parent / "sft_merged")
+                print(f"Merging SFT adapter {args.sft_output_dir} into {args.base_model} -> {merged_dir}")
+                base = AutoModelForCausalLM.from_pretrained(args.base_model, torch_dtype=torch.bfloat16)
+                merged = PeftModel.from_pretrained(base, args.sft_output_dir).merge_and_unload()
+                merged.save_pretrained(merged_dir)
+                AutoTokenizer.from_pretrained(args.sft_output_dir).save_pretrained(merged_dir)
+                del base, merged
+                _free_vram()
+                grpo_init_model = merged_dir
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: could not merge SFT adapter ({exc}); GRPO will start from the base model.")
+
             grpo_trainer = create_agentic_trainer(
                 algorithm="grpo",
-                model=args.base_model,
+                model=grpo_init_model,
                 train_dataset=grpo_dataset,
                 tools=make_callable_ledger_tools(),
                 reward_funcs=[agenttune_grpo_reward_fn],

@@ -9,10 +9,13 @@ Supports two execution modes:
    Runs live multi-turn tool-calling rollouts of real LLM checkpoints against
    `DoubleEntryLedgerEnv` (via `live_rollout.py`) and scores every trajectory with
    AuditKIT's `AgentEvalRunner`.
-2. Controlled Policy / Recorded Evaluation (default offline mode):
-   Evaluates recorded & failure-injected agent policies across the 25 held-out validation
-   episodes (`data/agenttune_sft_val.jsonl`) and verifies native `episodes_from_agenttune`
-   import on `data/agenttune_native_val_trajectories.jsonl`.
+2. Harness Sanity Check (default offline mode, NO language model is loaded):
+   Runs three hand-written policies over the 25 held-out episodes
+   (`data/agenttune_sft_val.jsonl`): a fault-injected replay of the teacher trajectory,
+   a replay with one redundant step, and the unmodified teacher replay. This verifies that
+   every metric detects the failure it targets; it says nothing about trained models.
+   Also verifies native `episodes_from_agenttune` import on
+   `data/agenttune_native_val_trajectories.jsonl`.
 """
 
 from __future__ import annotations
@@ -188,7 +191,7 @@ class LedgerAgentModelBackend:
                 "terminated_cleanly": True,
             }
 
-        # Controlled Baseline Failure-Injection Policy (`baseline_zeroshot`)
+        # Scripted Fault-Injected Policy (harness sanity check, not a model)
         corrupted_msgs = copy.deepcopy(ref_msgs)
         failure_bucket = episode_idx % 5
 
@@ -660,9 +663,24 @@ def run_full_auditkit_benchmark(
     adapter = LedgerAgentAdapter(tool_schemas)
     metrics = AuditKitMetricSuite(tool_schemas)
 
-    base_name = f"Baseline-ZeroShot-{model_family_label}"
-    sft_name = f"AgentTune-Stage1-SFT-{model_family_label}"
-    grpo_name = f"AgentTune-Stage2-GRPO-{model_family_label}"
+    is_live = any(p is not None for p in (baseline_policy, sft_policy, grpo_policy))
+    if is_live:
+        # Real LLM checkpoints rolled out against DoubleEntryLedgerEnv.
+        base_name = f"Baseline-ZeroShot-{model_family_label}"
+        sft_name = f"AgentTune-Stage1-SFT-{model_family_label}"
+        grpo_name = f"AgentTune-Stage2-GRPO-{model_family_label}"
+        column_titles = ("Baseline (`Zero-Shot`)", "AgentTune Stage-1 (`SFT`)", "AgentTune Stage-2 (`SFT + GRPO`)")
+        report_stem = "auditkit_live_gpu_rollout"
+    else:
+        # Harness sanity check: NO LLM is loaded. These are hand-written policies that
+        # replay the teacher trajectory with/without injected faults, used only to verify
+        # that every metric detects the failure it is designed to detect.
+        model_family_label = "scripted-policies (no LLM)"
+        base_name = "Scripted-FaultInjected-Policy"
+        sft_name = "Scripted-RedundantStep-Policy"
+        grpo_name = "Teacher-Oracle-Replay"
+        column_titles = ("Scripted Fault-Injected", "Scripted Redundant-Step", "Teacher Oracle Replay")
+        report_stem = "auditkit_harness_sanity_check"
 
     models = [
         LedgerAgentModelBackend(base_name, mode="baseline_zeroshot", live_policy=baseline_policy),
@@ -723,11 +741,7 @@ def run_full_auditkit_benchmark(
         ),
     }
 
-    eval_mode_label = (
-        "live_model_rollout"
-        if any(p is not None for p in (baseline_policy, sft_policy, grpo_policy))
-        else "controlled_policy_ablation"
-    )
+    eval_mode_label = "live_model_rollout" if is_live else "harness_sanity_check_scripted_policies"
 
     report = {
         "auditkit_version": getattr(ak, "__version__", "standalone"),
@@ -735,6 +749,14 @@ def run_full_auditkit_benchmark(
         "episodes_from_agenttune_bridge_verified": native_bridge_verified,
         "evaluation_mode": eval_mode_label,
         "model_family": model_family_label,
+        "policy_labels": {"baseline": base_name, "sft": sft_name, "grpo": grpo_name},
+        "note": (
+            "Live rollouts of real model checkpoints against DoubleEntryLedgerEnv."
+            if is_live
+            else "Harness sanity check only. No language model is evaluated: the three policies are "
+            "hand-written replays of the teacher trajectory (with injected faults, with one redundant "
+            "step, and unmodified). Results verify the metrics, not any trained model."
+        ),
         "auditkit_pipeline_stages": ["Dataset", "Adapter", "Model", "Metrics", "RunResult"],
         "evaluation_dataset": str(val_path.name),
         "num_validation_episodes": len(dataset),
@@ -742,38 +764,56 @@ def run_full_auditkit_benchmark(
         "improvement_deltas_grpo_vs_baseline": deltas,
     }
 
-    report_path = data_dir / "auditkit_evaluation_report.json"
+    report_path = data_dir / f"{report_stem}_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
+    c1, c2, c3 = column_titles
+    title = (
+        "# AuditKIT Live Rollout Report (real model checkpoints)"
+        if is_live
+        else "# AuditKIT Harness Sanity Check (scripted policies, no LLM)"
+    )
+
+    def row(label: str, key: str, fmt: str = "{:.2f}%") -> str:
+        b, s, g = base_agg[key], sft_agg[key], grpo_agg[key]
+        return f"| {label} | {fmt.format(b)} | {fmt.format(s)} | {fmt.format(g)} |"
+
     md = [
-        "# Phase 4: AuditKIT Evaluation Report",
+        title,
         "",
-        f"- **AuditKIT Engine:** `auditkit v{report['auditkit_version']}` (`AgentEvalRunner` + Double-Entry Invariant Suite)",
-        f"- **Evaluation Mode:** `{eval_mode_label}`",
-        f"- **Dataset Split:** `{val_path.name}` ({len(dataset)} held-out multi-hop validation episodes across all 5 workflow archetypes)",
-        f"- **`episodes_from_agenttune` Bridge Verified:** `{native_bridge_verified}`",
+        f"> {report['note']}",
         "",
-        "## Aggregate Benchmark Comparison",
+        f"- **AuditKIT version:** `{report['auditkit_version']}`",
+        f"- **Evaluation mode:** `{eval_mode_label}`",
+        f"- **Dataset:** `{val_path.name}` ({len(dataset)} held-out episodes, 5 workflow archetypes)",
+        f"- **`episodes_from_agenttune` bridge verified:** `{native_bridge_verified}`",
         "",
-        "| Metric | Baseline (`Zero-Shot`) | AgentTune Stage-1 (`SFT`) | AgentTune Stage-2 (`SFT + GRPO`) | Delta (`GRPO` vs. `Baseline`) |",
-        "| :--- | :---: | :---: | :---: | :---: |",
-        f"| **Tool-Call Syntax Accuracy (%)** | {base_agg['tool_call_syntax_accuracy_pct']:.2f}% | {sft_agg['tool_call_syntax_accuracy_pct']:.2f}% | **{grpo_agg['tool_call_syntax_accuracy_pct']:.2f}%** | **+{deltas['syntax_accuracy_gain_pct']:.2f}%** |",
-        f"| **AuditKIT Tool-Call F1 (%)** | {base_agg['auditkit_tool_call_f1_pct']:.2f}% | {sft_agg['auditkit_tool_call_f1_pct']:.2f}% | **{grpo_agg['auditkit_tool_call_f1_pct']:.2f}%** | **+{deltas['auditkit_tool_f1_gain_pct']:.2f}%** |",
-        f"| **Avg Steps to Completion** *(Optimal = {grpo_agg['optimal_steps_baseline']:.2f})* | {base_agg['avg_steps_to_completion']:.2f} steps | {sft_agg['avg_steps_to_completion']:.2f} steps | **{grpo_agg['avg_steps_to_completion']:.2f} steps** | **-{deltas['step_reduction_per_episode']:.2f} steps** |",
-        f"| **Trajectory Efficiency (%)** | {base_agg['trajectory_efficiency_pct']:.2f}% | {sft_agg['trajectory_efficiency_pct']:.2f}% | **{grpo_agg['trajectory_efficiency_pct']:.2f}%** | **+{deltas['efficiency_gain_pct']:.2f}%** |",
-        f"| **Double-Entry Invariant Rate (%)** | {base_agg['double_entry_invariant_rate_pct']:.2f}% | {sft_agg['double_entry_invariant_rate_pct']:.2f}% | **{grpo_agg['double_entry_invariant_rate_pct']:.2f}%** | **+{deltas['double_entry_invariant_gain_pct']:.2f}%** |",
-        f"| **Statechart Transition Accuracy (%)** | {base_agg['statechart_transition_accuracy_pct']:.2f}% | {sft_agg['statechart_transition_accuracy_pct']:.2f}% | **{grpo_agg['statechart_transition_accuracy_pct']:.2f}%** | **+{deltas['statechart_accuracy_gain_pct']:.2f}%** |",
-        f"| **Unsafe Commit Violation Rate (%)** *(Lower is safer)* | {base_agg['unsafe_commit_violation_rate_pct']:.2f}% | {sft_agg['unsafe_commit_violation_rate_pct']:.2f}% | **{grpo_agg['unsafe_commit_violation_rate_pct']:.2f}%** | **-{deltas['unsafe_commit_reduction_pct']:.2f}%** |",
-        f"| **Terminal Audit Seal Rate (%)** | {base_agg['terminal_audit_seal_rate_pct']:.2f}% | {sft_agg['terminal_audit_seal_rate_pct']:.2f}% | **{grpo_agg['terminal_audit_seal_rate_pct']:.2f}%** | **+{deltas['terminal_audit_seal_gain_pct']:.2f}%** |",
-        f"| **Mean Deterministic GRPO Reward** $\\in [-0.50, +1.00]$ | {base_agg['mean_grpo_reward']:+.4f} | {sft_agg['mean_grpo_reward']:+.4f} | **{grpo_agg['mean_grpo_reward']:+.4f}** | **+{deltas['grpo_reward_delta']:.4f}** |",
+        f"| Metric | {c1} | {c2} | {c3} |",
+        "| :--- | :---: | :---: | :---: |",
+        row("Tool-call syntax accuracy", "tool_call_syntax_accuracy_pct"),
+        row(
+            "AuditKIT tool-call F1"
+            if AUDITKIT_NATIVE_AVAILABLE
+            else "Tool-call F1 (FALLBACK: AuditKIT not installed, equals syntax validity)",
+            "auditkit_tool_call_f1_pct",
+        ),
+        row(f"Avg steps (optimal = {grpo_agg['optimal_steps_baseline']:.2f})", "avg_steps_to_completion", "{:.2f}"),
+        row("Trajectory efficiency", "trajectory_efficiency_pct"),
+        row("Double-entry invariant rate", "double_entry_invariant_rate_pct"),
+        row("Statechart transition accuracy", "statechart_transition_accuracy_pct"),
+        row("Unsafe commit violation rate (lower is better)", "unsafe_commit_violation_rate_pct"),
+        row("Terminal audit seal rate", "terminal_audit_seal_rate_pct"),
+        row("Mean deterministic reward [-0.5, 1.0]", "mean_grpo_reward", "{:+.4f}"),
         "",
-        "## Reproducibility Fingerprints (`AuditKitRunResult`)",
+        "## Config fingerprints",
+        "SHA-256 hashes of each run's evaluation configuration. They identify the run setup; they do not certify results.",
+        "",
         f"- `{base_name}`: `{results[base_name].config_fingerprint}`",
         f"- `{sft_name}`: `{results[sft_name].config_fingerprint}`",
         f"- `{grpo_name}`: `{results[grpo_name].config_fingerprint}`",
     ]
-    md_path = data_dir / "auditkit_evaluation_summary.md"
+    md_path = data_dir / f"{report_stem}_summary.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(md) + "\n")
 

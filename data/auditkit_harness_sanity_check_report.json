@@ -2,8 +2,14 @@
   "auditkit_version": "standalone",
   "auditkit_native_runner_used": false,
   "episodes_from_agenttune_bridge_verified": false,
-  "evaluation_mode": "controlled_policy_ablation",
-  "model_family": "Qwen2.5-1.5B-Instruct",
+  "evaluation_mode": "harness_sanity_check_scripted_policies",
+  "model_family": "scripted-policies (no LLM)",
+  "policy_labels": {
+    "baseline": "Scripted-FaultInjected-Policy",
+    "sft": "Scripted-RedundantStep-Policy",
+    "grpo": "Teacher-Oracle-Replay"
+  },
+  "note": "Harness sanity check only. No language model is evaluated: the three policies are hand-written replays of the teacher trajectory (with injected faults, with one redundant step, and unmodified). Results verify the metrics, not any trained model.",
   "auditkit_pipeline_stages": [
     "Dataset",
     "Adapter",
@@ -14,12 +20,12 @@
   "evaluation_dataset": "agenttune_sft_val.jsonl",
   "num_validation_episodes": 25,
   "models": {
-    "Baseline-ZeroShot-Qwen2.5-1.5B-Instruct": {
-      "model_id": "Baseline-ZeroShot-Qwen2.5-1.5B-Instruct",
+    "Scripted-FaultInjected-Policy": {
+      "model_id": "Scripted-FaultInjected-Policy",
       "evaluation_mode": "controlled_policy_ablation",
       "dataset_split": "agenttune_sft_val_25",
       "num_episodes": 25,
-      "config_fingerprint": "SHA256:856e711be9d39819",
+      "config_fingerprint": "SHA256:253f88335eaaf455",
       "aggregate_metrics": {
         "tool_call_syntax_accuracy_pct": 97.78,
         "auditkit_tool_call_f1_pct": 97.78,
@@ -709,12 +715,12 @@
         }
       ]
     },
-    "AgentTune-Stage1-SFT-Qwen2.5-1.5B-Instruct": {
-      "model_id": "AgentTune-Stage1-SFT-Qwen2.5-1.5B-Instruct",
+    "Scripted-RedundantStep-Policy": {
+      "model_id": "Scripted-RedundantStep-Policy",
       "evaluation_mode": "controlled_policy_ablation",
       "dataset_split": "agenttune_sft_val_25",
       "num_episodes": 25,
-      "config_fingerprint": "SHA256:c785a16ffa6a445f",
+      "config_fingerprint": "SHA256:b95f8ea9f97e8f26",
       "aggregate_metrics": {
         "tool_call_syntax_accuracy_pct": 100.0,
         "auditkit_tool_call_f1_pct": 100.0,
@@ -1314,12 +1320,12 @@
         }
       ]
     },
-    "AgentTune-Stage2-GRPO-Qwen2.5-1.5B-Instruct": {
-      "model_id": "AgentTune-Stage2-GRPO-Qwen2.5-1.5B-Instruct",
+    "Teacher-Oracle-Replay": {
+      "model_id": "Teacher-Oracle-Replay",
       "evaluation_mode": "controlled_policy_ablation",
       "dataset_split": "agenttune_sft_val_25",
       "num_episodes": 25,
-      "config_fingerprint": "SHA256:474c6650c17889bd",
+      "config_fingerprint": "SHA256:63101a68916b492e",
       "aggregate_metrics": {
         "tool_call_syntax_accuracy_pct": 100.0,
         "auditkit_tool_call_f1_pct": 100.0,
