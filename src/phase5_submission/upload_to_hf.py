@@ -22,6 +22,11 @@ def main() -> None:
     parser.add_argument("--token", type=str, default=None, help="Hugging Face WRITE token (or set HF_TOKEN)")
     parser.add_argument("--model-repo-name", type=str, default="ledgertune-tiny-aya-global-agent")
     parser.add_argument("--dataset-repo-name", type=str, default="ledgertune-double-entry-ledger-dataset")
+    parser.add_argument(
+        "--collections-only",
+        action="store_true",
+        help="Skip full folder upload (keeps existing 758MB weights on HF) and only create the HF Collections + update README cards.",
+    )
     args = parser.parse_args()
 
     from huggingface_hub import HfApi, create_collection
@@ -34,94 +39,118 @@ def main() -> None:
     model_repo_id = f"{username}/{args.model_repo_name}"
     dataset_repo_id = f"{username}/{args.dataset_repo_name}"
 
-    # -------------------------------------------------------------------------
-    # 1. Create & Upload Public Model Repository (Adapters + Checkpoints + Logs)
-    # -------------------------------------------------------------------------
-    print(f"\n[1/3] Creating & uploading public Model Repo -> https://huggingface.co/{model_repo_id}")
-    api.create_repo(repo_id=model_repo_id, repo_type="model", private=False, exist_ok=True)
+    if not args.collections_only:
+        # -------------------------------------------------------------------------
+        # 1. Create & Upload Public Model Repository (Adapters + Checkpoints + Logs)
+        # -------------------------------------------------------------------------
+        print(f"\n[1/3] Creating & uploading public Model Repo -> https://huggingface.co/{model_repo_id}")
+        api.create_repo(repo_id=model_repo_id, repo_type="model", private=False, exist_ok=True)
 
-    with tempfile.TemporaryDirectory() as tmp_model_dir:
-        tmp_m = Path(tmp_model_dir)
-        # Copy README.md as Model Card with YAML frontmatter
+        with tempfile.TemporaryDirectory() as tmp_model_dir:
+            tmp_m = Path(tmp_model_dir)
+            # Copy README.md as Model Card with YAML frontmatter
+            readme_body = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+            model_card = (
+                "---\n"
+                "library_name: peft\n"
+                "base_model:\n"
+                "- CohereLabs/tiny-aya-global\n"
+                "- Qwen/Qwen2.5-1.5B-Instruct\n"
+                "tags:\n"
+                "- agenttune\n"
+                "- auditkit\n"
+                "- double-entry-ledger\n"
+                "- tool-calling\n"
+                "- grpo\n"
+                "- sft\n"
+                "---\n\n"
+                + readme_body
+            )
+            (tmp_m / "README.md").write_text(model_card, encoding="utf-8")
+
+            ckpt_src = ROOT_DIR / "checkpoints"
+            if ckpt_src.exists():
+                for item in ckpt_src.iterdir():
+                    if item.is_dir() and not item.name.endswith("_merged"):
+                        shutil.copytree(item, tmp_m / "checkpoints" / item.name, dirs_exist_ok=True)
+
+            api.upload_folder(
+                folder_path=str(tmp_m),
+                repo_id=model_repo_id,
+                repo_type="model",
+                commit_message="Upload LedgerTune SFT & GRPO adapters, trainer logs, and Lexsi provenance",
+            )
+        print(f"  [OK] Uploaded Model Repo: https://huggingface.co/{model_repo_id}")
+
+        # -------------------------------------------------------------------------
+        # 2. Create & Upload Public Dataset Repository (Datasets + Traces + Reports)
+        # -------------------------------------------------------------------------
+        print(f"\n[2/3] Creating & uploading public Dataset Repo -> https://huggingface.co/{dataset_repo_id}")
+        api.create_repo(repo_id=dataset_repo_id, repo_type="dataset", private=False, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmp_data_dir:
+            tmp_d = Path(tmp_data_dir)
+            readme_body = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
+            dataset_card = (
+                "---\n"
+                "task_categories:\n"
+                "- text-generation\n"
+                "language:\n"
+                "- en\n"
+                "tags:\n"
+                "- agenttune\n"
+                "- auditkit\n"
+                "- financial-ledger\n"
+                "- tool-calling\n"
+                "- synthetic-trajectories\n"
+                "---\n\n"
+                + readme_body
+            )
+            (tmp_d / "README.md").write_text(dataset_card, encoding="utf-8")
+
+            data_src = ROOT_DIR / "data"
+            if data_src.exists():
+                shutil.copytree(data_src, tmp_d / "data", dirs_exist_ok=True)
+
+            for trace_dir in ("grpo_tiny_aya", "grpo_ledger"):
+                trace_file = ROOT_DIR / "checkpoints" / trace_dir / "trajectories.jsonl"
+                if trace_file.exists():
+                    (tmp_d / "traces").mkdir(exist_ok=True)
+                    shutil.copy2(trace_file, tmp_d / "traces" / f"{trace_dir}_trajectories.jsonl")
+
+            api.upload_folder(
+                folder_path=str(tmp_d),
+                repo_id=dataset_repo_id,
+                repo_type="dataset",
+                commit_message="Upload LedgerTune synthetic datasets, EventLog splits, GRPO traces, and AuditKIT reports",
+            )
+        print(f"  [OK] Uploaded Dataset Repo: https://huggingface.co/{dataset_repo_id}")
+    else:
         readme_body = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
         model_card = (
-            "---\n"
-            "library_name: peft\n"
-            "base_model:\n"
-            "- CohereLabs/tiny-aya-global\n"
-            "- Qwen/Qwen2.5-1.5B-Instruct\n"
-            "tags:\n"
-            "- agenttune\n"
-            "- auditkit\n"
-            "- double-entry-ledger\n"
-            "- tool-calling\n"
-            "- grpo\n"
-            "- sft\n"
-            "---\n\n"
+            "---\nlibrary_name: peft\nbase_model:\n- CohereLabs/tiny-aya-global\n- Qwen/Qwen2.5-1.5B-Instruct\n"
+            "tags:\n- agenttune\n- auditkit\n- double-entry-ledger\n- tool-calling\n- grpo\n- sft\n---\n\n"
             + readme_body
         )
-        (tmp_m / "README.md").write_text(model_card, encoding="utf-8")
-
-        ckpt_src = ROOT_DIR / "checkpoints"
-        if ckpt_src.exists():
-            # Copy all adapters (.safetensors), configs, trainer_state, provenance, and rollout logs
-            # Skip intermediate *_merged full base model copies so upload is fast
-            for item in ckpt_src.iterdir():
-                if item.is_dir() and not item.name.endswith("_merged"):
-                    shutil.copytree(item, tmp_m / "checkpoints" / item.name, dirs_exist_ok=True)
-
-        api.upload_folder(
-            folder_path=str(tmp_m),
+        dataset_card = (
+            "---\ntask_categories:\n- text-generation\nlanguage:\n- en\n"
+            "tags:\n- agenttune\n- auditkit\n- financial-ledger\n- tool-calling\n- synthetic-trajectories\n---\n\n"
+            + readme_body
+        )
+        api.upload_file(
+            path_or_fileobj=model_card.encode("utf-8"),
+            path_in_repo="README.md",
             repo_id=model_repo_id,
             repo_type="model",
-            commit_message="Upload LedgerTune SFT & GRPO adapters, trainer logs, and Lexsi provenance",
+            commit_message="Update README model card with CohereLabs/tiny-aya-global live results",
         )
-    print(f"  [OK] Uploaded Model Repo: https://huggingface.co/{model_repo_id}")
-
-    # -------------------------------------------------------------------------
-    # 2. Create & Upload Public Dataset Repository (Datasets + Traces + Reports)
-    # -------------------------------------------------------------------------
-    print(f"\n[2/3] Creating & uploading public Dataset Repo -> https://huggingface.co/{dataset_repo_id}")
-    api.create_repo(repo_id=dataset_repo_id, repo_type="dataset", private=False, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as tmp_data_dir:
-        tmp_d = Path(tmp_data_dir)
-        readme_body = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
-        dataset_card = (
-            "---\n"
-            "task_categories:\n"
-            "- text-generation\n"
-            "language:\n"
-            "- en\n"
-            "tags:\n"
-            "- agenttune\n"
-            "- auditkit\n"
-            "- financial-ledger\n"
-            "- tool-calling\n"
-            "- synthetic-trajectories\n"
-            "---\n\n"
-            + readme_body
-        )
-        (tmp_d / "README.md").write_text(dataset_card, encoding="utf-8")
-
-        data_src = ROOT_DIR / "data"
-        if data_src.exists():
-            shutil.copytree(data_src, tmp_d / "data", dirs_exist_ok=True)
-
-        # Also include the GRPO rollout trajectory traces in the dataset repo
-        for trace_dir in ("grpo_tiny_aya", "grpo_ledger"):
-            trace_file = ROOT_DIR / "checkpoints" / trace_dir / "trajectories.jsonl"
-            if trace_file.exists():
-                (tmp_d / "traces").mkdir(exist_ok=True)
-                shutil.copy2(trace_file, tmp_d / "traces" / f"{trace_dir}_trajectories.jsonl")
-
-        api.upload_folder(
-            folder_path=str(tmp_d),
+        api.upload_file(
+            path_or_fileobj=dataset_card.encode("utf-8"),
+            path_in_repo="README.md",
             repo_id=dataset_repo_id,
             repo_type="dataset",
-            commit_message="Upload LedgerTune synthetic datasets, EventLog splits, GRPO traces, and AuditKIT reports",
+            commit_message="Update README dataset card with CohereLabs/tiny-aya-global live results",
         )
-    print(f"  [OK] Uploaded Dataset Repo: https://huggingface.co/{dataset_repo_id}")
 
     # -------------------------------------------------------------------------
     # 3. Create Public Hugging Face Model & Dataset Collections
@@ -129,9 +158,9 @@ def main() -> None:
     print("\n[3/3] Creating Public Hugging Face Collections...")
     try:
         model_col = create_collection(
-            title="LedgerTune - Double-Entry Ledger Agent Models & Adapters",
+            title="LedgerTune Models and Adapters",
             namespace=username,
-            description="Fine-tuned Stage-1 SFT and Stage-2 GRPO LoRA adapters, training logs, and provenance for the Double-Entry Financial Ledger Workflow Agent (AgentTune + AuditKIT).",
+            description="Stage-1 SFT and Stage-2 GRPO LoRA adapters, logs, and provenance (AgentTune + AuditKIT).",
             private=False,
             token=args.token,
             exists_ok=True,
@@ -155,9 +184,9 @@ def main() -> None:
 
     try:
         data_col = create_collection(
-            title="LedgerTune - Double-Entry Ledger Datasets, Traces & Benchmarks",
+            title="LedgerTune Datasets and Benchmarks",
             namespace=username,
-            description="150 verified double-entry trajectories, EventLog SFT splits, GRPO rollout traces, and AuditKIT evaluation reports.",
+            description="150 verified double-entry trajectories, EventLog splits, GRPO traces, and AuditKIT reports.",
             private=False,
             token=args.token,
             exists_ok=True,
