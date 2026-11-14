@@ -20,48 +20,67 @@ def _pct(x: float) -> str:
 def validate_phase5_submission() -> None:
     print("=== Running Phase 5 Submission Packaging Validation Gate ===")
     readme = (ROOT_DIR / "README.md").read_text(encoding="utf-8")
-    live = json.loads((ROOT_DIR / "data" / "auditkit_live_gpu_rollout_report.json").read_text(encoding="utf-8"))
+    live_qwen = json.loads((ROOT_DIR / "data" / "auditkit_live_gpu_rollout_report.json").read_text(encoding="utf-8"))
+    live_aya = json.loads((ROOT_DIR / "data" / "auditkit_live_tiny_aya_report.json").read_text(encoding="utf-8"))
     sanity = json.loads(
         (ROOT_DIR / "data" / "auditkit_harness_sanity_check_report.json").read_text(encoding="utf-8")
     )
-    sft_state = json.loads(
+    sft_state_qwen = json.loads(
         (ROOT_DIR / "checkpoints" / "sft_ledger" / "checkpoint-51" / "trainer_state.json").read_text(encoding="utf-8")
     )
+    sft_state_aya = json.loads(
+        (ROOT_DIR / "checkpoints" / "sft_tiny_aya" / "checkpoint-51" / "trainer_state.json").read_text(encoding="utf-8")
+    )
+    grpo_state_aya = json.loads(
+        (ROOT_DIR / "checkpoints" / "grpo_tiny_aya" / "checkpoint-30" / "trainer_state.json").read_text(encoding="utf-8")
+    )
 
-    # 1. Live GPU numbers in README match the live report
-    print("\n=== [1/4] Live GPU rollout metrics in README match the report ===")
-    assert live["evaluation_mode"] == "live_model_rollout"
-    label = live["model_family"]
-    base = live["models"][f"Baseline-ZeroShot-{label}"]["aggregate_metrics"]
-    sft = live["models"][f"AgentTune-Stage1-SFT-{label}"]["aggregate_metrics"]
-    snippets = [
-        _pct(base["auditkit_tool_call_f1_pct"]),
-        _pct(sft["auditkit_tool_call_f1_pct"]),
-        _pct(sft["auditkit_verified_outcome_pct"]),
-        _pct(sft["tool_call_syntax_accuracy_pct"]),
-        _pct(base["double_entry_invariant_rate_pct"]),
-        _pct(sft["double_entry_invariant_rate_pct"]),
-        f"{base['avg_steps_to_completion']:.2f}",
-        f"{sft['avg_steps_to_completion']:.2f}",
-        f"{sft['avg_redundant_steps']:.2f}",
-        f"{base['mean_grpo_reward']:+.4f}",
-        f"{sft['mean_grpo_reward']:+.4f}",
-        live["auditkit_version"],
-    ]
-    for s in snippets:
-        assert s in readme, f"README.md is missing live-report value: {s}"
-    print(f"  [PASS] {len(snippets)} live-report values found in README.md")
+    # 1. Live GPU numbers in README match BOTH live reports (Iteration 2 Tiny Aya + Iteration 1 Qwen)
+    print("\n=== [1/4] Live GPU rollout metrics in README match both live reports ===")
+    for run_name, live in [("CohereLabs/tiny-aya-global", live_aya), ("Qwen2.5-1.5B-Instruct", live_qwen)]:
+        assert live["evaluation_mode"] == "live_model_rollout"
+        label = live["model_family"]
+        base = live["models"][f"Baseline-ZeroShot-{label}"]["aggregate_metrics"]
+        sft = live["models"][f"AgentTune-Stage1-SFT-{label}"]["aggregate_metrics"]
+        grpo = live["models"][f"AgentTune-Stage2-GRPO-{label}"]["aggregate_metrics"]
+        snippets = [
+            _pct(base["auditkit_tool_call_f1_pct"]),
+            _pct(sft["auditkit_tool_call_f1_pct"]),
+            _pct(grpo["auditkit_tool_call_f1_pct"]),
+            _pct(base["tool_call_syntax_accuracy_pct"]),
+            _pct(sft["tool_call_syntax_accuracy_pct"]),
+            _pct(grpo["tool_call_syntax_accuracy_pct"]),
+            _pct(base["double_entry_invariant_rate_pct"]),
+            _pct(sft["double_entry_invariant_rate_pct"]),
+            f"{base['avg_steps_to_completion']:.2f}",
+            f"{sft['avg_steps_to_completion']:.2f}",
+            f"{grpo['avg_steps_to_completion']:.2f}",
+            f"{base['mean_grpo_reward']:+.4f}",
+            f"{sft['mean_grpo_reward']:+.4f}",
+            f"{grpo['mean_grpo_reward']:+.4f}",
+            live["auditkit_version"],
+        ]
+        for s in snippets:
+            assert s in readme, f"README.md is missing {run_name} live-report value: {s}"
+        print(f"  [PASS] {run_name}: {len(snippets)} live-report values verified in README.md")
 
-    # 2. SFT training curve in README matches trainer_state.json
-    print("\n=== [2/4] SFT training curve in README matches trainer_state.json ===")
-    logs = sft_state["log_history"]
-    first, last = logs[0], logs[-1]
-    for s in [f"{first['loss']:.4f}", f"{last['loss']:.4f}",
-              _pct(100 * first["mean_token_accuracy"]), _pct(100 * last["mean_token_accuracy"])]:
-        assert s in readme, f"README.md is missing SFT training value: {s}"
-    assert sft_state["global_step"] == 51
-    print(f"  [PASS] loss {first['loss']:.4f} -> {last['loss']:.4f}, "
-          f"token acc {100 * first['mean_token_accuracy']:.2f}% -> {100 * last['mean_token_accuracy']:.2f}%")
+    # 2. SFT & GRPO training curves in README match trainer_state.json
+    print("\n=== [2/4] SFT & GRPO training curves in README match trainer_state.json ===")
+    for run_name, sft_state in [("CohereLabs/tiny-aya-global", sft_state_aya), ("Qwen2.5-1.5B-Instruct", sft_state_qwen)]:
+        logs = sft_state["log_history"]
+        first, last = logs[0], logs[-1]
+        for s in [f"{first['loss']:.4f}", f"{last['loss']:.4f}",
+                  _pct(100 * first["mean_token_accuracy"]), _pct(100 * last["mean_token_accuracy"])]:
+            assert s in readme, f"README.md is missing {run_name} SFT training value: {s}"
+        assert sft_state["global_step"] == 51
+        print(f"  [PASS] {run_name} SFT: loss {first['loss']:.4f} -> {last['loss']:.4f}, "
+              f"token acc {100 * first['mean_token_accuracy']:.2f}% -> {100 * last['mean_token_accuracy']:.2f}%")
+
+    grpo_logs = grpo_state_aya["log_history"]
+    for entry in grpo_logs:
+        r_str = f"{entry['reward']:+.4f}"
+        assert r_str in readme, f"README.md is missing Tiny Aya GRPO reward value: {r_str}"
+    print(f"  [PASS] CohereLabs/tiny-aya-global GRPO: reward {grpo_logs[0]['reward']:+.4f} -> {grpo_logs[-1]['reward']:+.4f}")
 
     # 3. Honest labelling: sanity check is scripted; limitations are documented
     print("\n=== [3/4] Sanity check labelled as scripted; limitations documented ===")
@@ -71,6 +90,8 @@ def validate_phase5_submission() -> None:
         "Harness sanity check (scripted policies, no LLM)",
         "Limitations and known issues",
         "GRPO did not train",
+        "CohereLabs/tiny-aya-global",
+        "ROI & Deployment Economics",
         "Total Assets",
         "Total Liabilities",
         "Normal Balance Polarity Matrix",
@@ -82,7 +103,7 @@ def validate_phase5_submission() -> None:
         "Architectural Trade-Offs",
     ]:
         assert concept in readme, f"README.md missing section/concept: {concept}"
-    print("  [PASS] Scripted policies carry no model names; limitations, statechart and accounting docs present")
+    print("  [PASS] Scripted policies carry no model names; limitations, ROI, statechart and accounting docs present")
 
     # 4. Deliverable manifest
     print("\n=== [4/4] Repository file manifest ===")
@@ -105,6 +126,7 @@ def validate_phase5_submission() -> None:
         "src/phase4_auditkit/auditkit_harness.py",
         "src/phase4_auditkit/validate_phase4.py",
         "src/phase5_submission/validate_phase5.py",
+        "src/phase5_submission/upload_to_hf.py",
         "data/phase2_canonical_5_trajectories.json",
         "data/phase2_canonical_5_readable.md",
         "data/phase2_synthetic_dataset_150.jsonl",
@@ -115,12 +137,19 @@ def validate_phase5_submission() -> None:
         "data/agenttune_eventlog_sft_train.jsonl",
         "data/auditkit_live_gpu_rollout_report.json",
         "data/auditkit_live_gpu_rollout_summary.md",
+        "data/auditkit_live_tiny_aya_report.json",
+        "data/auditkit_live_tiny_aya_summary.md",
         "data/auditkit_harness_sanity_check_report.json",
         "data/auditkit_harness_sanity_check_summary.md",
         "checkpoints/sft_ledger/checkpoint-51/trainer_state.json",
         "checkpoints/grpo_ledger/lexsi_provenance.json",
         "checkpoints/grpo_ledger/training_stats.json",
         "checkpoints/grpo_ledger/trajectories.jsonl",
+        "checkpoints/sft_tiny_aya/checkpoint-51/trainer_state.json",
+        "checkpoints/grpo_tiny_aya/checkpoint-30/trainer_state.json",
+        "checkpoints/grpo_tiny_aya/lexsi_provenance.json",
+        "checkpoints/grpo_tiny_aya/training_stats.json",
+        "checkpoints/grpo_tiny_aya/trajectories.jsonl",
     ]
     for rel in expected_files:
         p = ROOT_DIR / rel

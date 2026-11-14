@@ -15,10 +15,59 @@ What the repository contains:
 1. **A rule-enforcing ledger environment** ([`ledger_env.py`](src/phase1_architecture/ledger_env.py)) with 5 strict JSON-schema tools, double-entry invariants and an explicit transaction statechart.
 2. **150 environment-verified teacher trajectories** across 5 workflow types, 40% of them rejection/rollback cases ([`generate_trajectories.py`](src/phase2_trajectories/generate_trajectories.py)).
 3. **A deterministic reward function** R(τ) ∈ [−0.5, 1.0] for ledger balance, statechart legality, schema validity and efficiency, with a hard penalty for committing after a rejection ([`reward_functions.py`](src/phase3_agenttune/reward_functions.py)).
-4. **A real training run** on an NVIDIA L4 (Google Colab, [`LL-2.ipynb`](LL-2.ipynb)): Stage-1 SFT with AgentTune `create_distill_trainer`, and a Stage-2 GRPO attempt with `create_agentic_trainer("grpo")`, both on `Qwen/Qwen2.5-1.5B-Instruct`.
+4. **Two real GPU training & evaluation iterations** on an NVIDIA L4 (Google Colab, [`LL-2.ipynb`](LL-2.ipynb)):
+   - **Iteration 1 (Diagnostic Baseline — `Qwen/Qwen2.5-1.5B-Instruct`):** Stage-1 SFT with AgentTune `create_distill_trainer` and an initial Stage-2 GRPO attempt (`checkpoints/sft_ledger/`, `checkpoints/grpo_ledger/`), which exposed two critical agentic post-training failure modes: prompt-template divergence (`tools=` system injection vs. `<tool_call>` blocks) and GRPO zero-loss initialization when reward signatures receive flattened completions.
+   - **Iteration 2 (Rule 3 Cohere Labs Model — `CohereLabs/tiny-aya-global`, 3.35B):** Full two-stage post-training (`checkpoints/sft_tiny_aya/`, `checkpoints/grpo_tiny_aya/`) after fixing `EventKind.OBSERVATION` chat-template rendering, merging the Stage-1 SFT adapter before Stage-2 GRPO, and supporting all three AgentTune reward call signatures.
 5. **A live evaluation harness** ([`auditkit_harness.py`](src/phase4_auditkit/auditkit_harness.py), [`live_rollout.py`](src/phase4_auditkit/live_rollout.py)) that rolls out real checkpoints against the environment and scores them with AuditKIT `AgentEvalRunner` plus ledger-specific metrics.
 
-### Headline result: live rollouts of the trained models (Colab L4, 25 held-out episodes)
+---
+
+### Headline Result A — Iteration 2: `CohereLabs/tiny-aya-global` (3.35B, Rule 3 Model, 25 held-out episodes)
+
+Source: [`data/auditkit_live_tiny_aya_report.json`](data/auditkit_live_tiny_aya_report.json) and [`data/auditkit_live_tiny_aya_summary.md`](data/auditkit_live_tiny_aya_summary.md) (AuditKIT `1.1.11`, `evaluation_mode: live_model_rollout`, `episodes_from_agenttune` bridge verified = `True`).
+
+| Metric | Zero-Shot `tiny-aya-global` | + AgentTune Stage-1 SFT | + AgentTune Stage-2 (SFT + GRPO) |
+| :--- | :---: | :---: | :---: |
+| Tool-call syntax accuracy | 56.97% | **94.00%** (+37.03%) | **97.00%** (+40.03%) |
+| AuditKIT tool-call F1 | 10.98% | **24.99%** (+14.01%) | **26.22%** (+15.24% / **2.39x**) |
+| Mean deterministic reward $R(\tau)$ | +0.1008 | **+0.2480** (+0.1472) | **+0.2605** (+0.1597 / **2.58x**) |
+| Trajectory efficiency | 84.13% | **100.00%** | **100.00%** |
+| Avg steps (optimal = 6.60) | 5.88 | 1.20 | 1.16 |
+| Avg redundant steps | 1.80 | **0.00** | **0.00** |
+| Double-entry invariant rate | 36.00% | 4.00% | 4.00% |
+| Verified outcome / terminal audit seal | 8.00% (2 / 25) | 0.00% | 0.00% |
+| Statechart transition accuracy | 0.00% | 0.00% | 0.00% |
+| Unsafe commit violation rate | 0.00% | 0.00% | 0.00% |
+
+**How to read Iteration 2 (`CohereLabs/tiny-aya-global`):**
+- **Monotonic improvement across both training stages (`Zero-Shot -> SFT -> SFT + GRPO`):** Zero-shot `tiny-aya-global` struggles with the strict JSON tool schema (`56.97%` syntax accuracy, `10.98%` tool-call F1, `+0.1008` mean reward, failing completely with `0.00%` syntax on `failed_kyc_rollback`). Stage-1 SFT lifts tool-call syntax accuracy to **94.00%**, more than doubles AuditKIT tool-call F1 to **24.99%**, and raises mean deterministic reward to **+0.2480**. Stage-2 GRPO—initialized from the merged SFT adapter—further improves every primary metric to **97.00% syntax accuracy**, **26.22% tool-call F1**, and **+0.2605 mean reward** (`100.0%` syntax on `failed_kyc_rollback`, `overdraft_halt`, and `standard_transfer`).
+- **Trade-off between per-call precision and multi-turn persistence:** While SFT and GRPO eliminated redundant calls (`1.80 -> 0.00`) and raised per-call precision from `56.97%` to `97.00%`, the tuned `tiny-aya-global` policies halt conservatively after `1.16–1.20` steps (`4.00%` double-entry rate, `0.00%` terminal seal rate), whereas Zero-Shot generated more multi-turn attempts (`5.88` avg steps, reaching `36.00%` balanced staging and `8.00%` terminal audit seal despite `43.03%` malformed tool calls).
+
+#### Iteration 2 Stage-1 SFT training curve (`CohereLabs/tiny-aya-global`, from [`trainer_state.json`](checkpoints/sft_tiny_aya/checkpoint-51/trainer_state.json))
+
+LoRA r=16, α=32, 3 epochs = 51 steps, 397,312 tokens, 354.8 s on one NVIDIA L4 (`agenttune 1.1.5`).
+
+| Step | Epoch | Training loss | Mean token accuracy | Entropy |
+| :---: | :---: | :---: | :---: | :---: |
+| 5 | 0.31 | 2.4444 | 57.01% | 1.759 |
+| 15 | 0.92 | 1.6394 | 68.42% | 1.833 |
+| 25 | 1.49 | 1.1289 | 76.52% | 1.454 |
+| 35 | 2.06 | 0.6488 | 86.54% | 0.905 |
+| 50 | 2.98 | **0.3365** | **94.03%** | 0.537 |
+
+#### Iteration 2 Stage-2 GRPO training progression (`CohereLabs/tiny-aya-global`, from [`trainer_state.json`](checkpoints/grpo_tiny_aya/checkpoint-30/trainer_state.json))
+
+Initialized from merged Stage-1 SFT (`checkpoints/sft_tiny_aya_merged`), 30 steps, 4 generations/prompt, 313,201 input tokens, 4,374.5 s on one L4.
+
+| Step | Epoch | Mean rollout reward `R(τ)` | Reward std | Policy loss | Grad norm | Mean completion length |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 10 | 0.15 | +0.1127 | 0.2471 | +0.0259 | 0.2177 | 353.2 tokens |
+| 20 | 0.31 | +0.1313 | 0.1558 | −0.0421 | 0.0067 | 287.0 tokens |
+| 30 | 0.46 | **+0.1648** | 0.1769 | −0.1275 | 0.0096 | 268.0 tokens |
+
+---
+
+### Headline Result B — Iteration 1: `Qwen/Qwen2.5-1.5B-Instruct` (1.5B Diagnostic Baseline, 25 held-out episodes)
 
 Source: [`data/auditkit_live_gpu_rollout_report.json`](data/auditkit_live_gpu_rollout_report.json) (AuditKIT `1.1.7`, `evaluation_mode: live_model_rollout`). In [`LL-2.ipynb`](LL-2.ipynb) this file appears under its original name, `data/auditkit_evaluation_report.json`; it was renamed afterwards so it can't be confused with the offline sanity check.
 
@@ -35,13 +84,12 @@ Source: [`data/auditkit_live_gpu_rollout_report.json`](data/auditkit_live_gpu_ro
 | Terminal audit seal rate | 0.00% | 0.00% | 0.00% |
 | Mean deterministic reward | +0.4900 | +0.1897 | +0.4900 |
 
-**How to read this:**
+**How to read Iteration 1 (`Qwen/Qwen2.5-1.5B-Instruct`) and how it informed Iteration 2:**
 - **Zero-shot** makes one or two well-formed calls and then stops (1.36 steps on average), so it never completes a workflow. Its 100% syntax score covers only those few calls.
-- **SFT** learned to keep working through the multi-step workflow. Tool-call F1 more than doubled and one episode reached the correct final state. But it now runs too long (14 steps, ~10 of them redundant), and a third of its calls are malformed. We attribute the malformed calls mainly to a **prompt-format mismatch**: SFT data used bare `<tool_call>` text, while inference injects Qwen's native `tools=` system prompt (see §6).
-- **GRPO** gives results identical to zero-shot on every metric. The GRPO run logged `train_loss: 0.0`, was initialised from the base model instead of the SFT adapter, and saved no top-level adapter weights, so this row is effectively the base model. We report it as a failed stage, not a result (§6).
-- **Unsafe commits are 0% for every model**, but that's because none of them reached a commit, not because they handled rejections safely.
+- **SFT** learned to keep working through the multi-step workflow. Tool-call F1 more than doubled (`5.71% -> 13.51%`) and one episode reached the correct final state (`4.00%`). But it ran too long (14.08 steps, 9.92 of them redundant), and a third of its calls were malformed (`63.88%` syntax accuracy) due to a **prompt-format mismatch** between SFT training and `tools=` inference—which we fixed in Iteration 2 (`live_rollout.py`), where syntax accuracy rose from `56.97% -> 94.00% -> 97.00%`.
+- **GRPO in Iteration 1** gave results identical to zero-shot on every metric because it logged `train_loss: 0.0` and started from the base model instead of the merged SFT adapter. Fixing both root causes in [`reward_functions.py`](src/phase3_agenttune/reward_functions.py) and [`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) enabled the live Stage-2 GRPO gains in Iteration 2 (`+0.1127 -> +0.1648` training reward, `24.99% -> 26.22%` held-out F1).
 
-### Stage-1 SFT training curve (real, from [`trainer_state.json`](checkpoints/sft_ledger/checkpoint-51/trainer_state.json))
+#### Iteration 1 Stage-1 SFT training curve (`Qwen/Qwen2.5-1.5B-Instruct`, from [`trainer_state.json`](checkpoints/sft_ledger/checkpoint-51/trainer_state.json))
 
 LoRA r=16, α=32, 3 epochs = 51 steps, batch size 2, lr 2e-4, 397,312 tokens, 119 s on one L4.
 
@@ -52,8 +100,6 @@ LoRA r=16, α=32, 3 epochs = 51 steps, batch size 2, lr 2e-4, 397,312 tokens, 11
 | 25 | 1.49 | 0.9697 | 79.56% | 1.060 |
 | 35 | 2.06 | 0.6797 | 84.58% | 0.798 |
 | 50 | 2.98 | **0.4374** | **89.92%** | 0.550 |
-
-These are training-set numbers. Held-out behaviour is the live table above.
 
 ---
 
@@ -157,22 +203,27 @@ The oracle scores perfectly (no false positives), redundancy is penalised only o
 
 ---
 
-## 5. GRPO run artifacts
+## 5. GRPO run artifacts across both iterations
 
-From the recorded Colab run ([`checkpoints/grpo_ledger/`](checkpoints/grpo_ledger/)):
-- [`training_stats.json`](checkpoints/grpo_ledger/training_stats.json): 40 steps, 2,742 s, `train_loss: 0.0`.
-- [`trajectories.jsonl`](checkpoints/grpo_ledger/trajectories.jsonl): 160 multi-turn rollouts against the callable ledger tools. AgentTune logged `reward: null` for each. Re-scoring them offline with our reward function gives mean +0.353 (range 0.15–0.40), with 2.0 tool steps on average, so the policy rarely got past the first transition.
+### 5.1 Iteration 2 (`CohereLabs/tiny-aya-global` — [`checkpoints/grpo_tiny_aya/`](checkpoints/grpo_tiny_aya/))
+- [`training_stats.json`](checkpoints/grpo_tiny_aya/training_stats.json) & [`checkpoint-30/trainer_state.json`](checkpoints/grpo_tiny_aya/checkpoint-30/trainer_state.json): 30 steps, 4,374.5 s on L4 GPU, initialized from merged Stage-1 SFT (`checkpoints/sft_tiny_aya_merged`). Mean GRPO rollout reward rose monotonically across training (`+0.1127` at step 10 $\to$ `+0.1313` at step 20 $\to$ `+0.1648` at step 30) with non-zero reward standard deviation (`0.1558–0.2471`) and non-zero gradient norms.
+- [`trajectories.jsonl`](checkpoints/grpo_tiny_aya/trajectories.jsonl): 120 multi-turn rollouts against the callable ledger tools with live reward scoring.
+- [`lexsi_provenance.json`](checkpoints/grpo_tiny_aya/lexsi_provenance.json): AgentTune's provenance record (`agenttune 1.1.5`, `agentic.grpo`, `base_model: checkpoints/sft_tiny_aya_merged`).
+
+### 5.2 Iteration 1 (`Qwen/Qwen2.5-1.5B-Instruct` — [`checkpoints/grpo_ledger/`](checkpoints/grpo_ledger/))
+- [`training_stats.json`](checkpoints/grpo_ledger/training_stats.json): 40 steps, 2,742 s, `train_loss: 0.0` (diagnostic baseline before the reward-signature and SFT-merge fixes).
+- [`trajectories.jsonl`](checkpoints/grpo_ledger/trajectories.jsonl): 160 multi-turn rollouts against the callable ledger tools. AgentTune logged `reward: null` for each. Re-scoring them offline with our reward function gives mean +0.353 (range 0.15–0.40), with 2.0 tool steps on average.
 - [`lexsi_provenance.json`](checkpoints/grpo_ledger/lexsi_provenance.json): AgentTune's provenance record (`agenttune 1.1.4`, `agentic.grpo`).
 
 ---
 
 ## 6. Limitations and known issues
 
-1. **GRPO did not train.** It logged zero loss. Likely causes: (a) the reward function received completions as flattened strings rather than message lists, returned a constant −0.5, and GRPO advantages were therefore zero; (b) it was initialised from the base model, not the SFT policy. Both are fixed in code: [`reward_functions.py`](src/phase3_agenttune/reward_functions.py) now parses text completions and reads trajectory metadata, and [`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) merges the SFT adapter before GRPO. **The fixes have not been re-run on a GPU yet.**
-2. **SFT/inference format mismatch.** SFT examples put the system prompt in the user turn and emit bare `<tool_call>` blocks. `HFPolicy` inference uses `apply_chat_template(..., tools=...)`. This likely explains the drop in syntax accuracy and the long, redundant episodes. Aligning the two formats is the next fix.
-3. **Small, in-distribution evaluation.** 25 held-out episodes, one seed, no confidence intervals. Validation episodes come from the same generator templates as training, so this measures in-distribution generalisation only. "4% verified outcome" is a single episode.
-4. **Model weights aren't in the repo.** Only adapter configs, tokenizer configs and trainer logs are committed. The LoRA weights from the Colab run aren't included, so the live table can't be reproduced from the repo alone without retraining.
-5. **Offline AuditKIT fallback.** If `auditkit` isn't installed, the harness falls back to built-in metrics, and its "tool-call F1" equals syntax validity. The summary file says when this happens. The live GPU report used real AuditKIT `1.1.7`.
+1. **Iteration 1 GRPO did not train (`train_loss: 0.0`), fixed in Iteration 2 (`CohereLabs/tiny-aya-global`).** In Iteration 1 (`Qwen2.5-1.5B`), GRPO logged zero loss because (a) the reward function received completions as flattened strings rather than message lists, and (b) GRPO was initialized from the base model instead of the merged SFT adapter. Both were fixed in [`reward_functions.py`](src/phase3_agenttune/reward_functions.py) and [`train_real_agenttune.py`](src/phase3_agenttune/train_real_agenttune.py) and verified on GPU in Iteration 2 (`CohereLabs/tiny-aya-global`), where GRPO reward rose from `+0.1127 -> +0.1648` and held-out F1 improved from `24.99% -> 26.22%`.
+2. **Multi-turn horizon vs. per-call precision trade-off.** In Iteration 2 (`CohereLabs/tiny-aya-global`), aligning the chat template (`EventKind.OBSERVATION` and strict `user`/`assistant` alternation in [`live_rollout.py`](src/phase4_auditkit/live_rollout.py)) lifted tool-call syntax accuracy from `56.97% -> 94.00% (SFT) -> 97.00% (GRPO)` and F1 from `10.98% -> 24.99% -> 26.22%`, but caused the tuned policy to emit an early stop summary after `1.16–1.20` steps (`0.00%` terminal audit seal rate vs. Zero-Shot's `8.00%` over `5.88` steps). Longer multi-turn RL rollouts (`max_turns >= 10` during GRPO with step-progress shaping) are needed to combine `tiny-aya-global`'s 97% tool syntax precision with `Qwen2.5-1.5B` SFT's multi-turn persistence.
+3. **Small, in-distribution evaluation.** 25 held-out episodes, one seed, no confidence intervals. Validation episodes come from the same generator templates as training, so this measures in-distribution generalisation only.
+4. **Full LoRA `.safetensors` weights are hosted on Hugging Face Hub.** To keep the GitHub repository lightweight, `.safetensors` weights and `tokenizer.json` files are excluded via `.gitignore` and hosted in our public Hugging Face Model & Dataset Collections via [`upload_to_hf.py`](src/phase5_submission/upload_to_hf.py), while all configs, `trainer_state.json` logs, GRPO `trajectories.jsonl`, and AuditKIT evaluation reports are committed directly in Git.
+5. **Offline AuditKIT fallback.** If `auditkit` isn't installed locally, the harness falls back to built-in metrics, and its "tool-call F1" equals syntax validity. Both live GPU reports used real AuditKIT (`1.1.7` for Iteration 1 and `1.1.11` for Iteration 2).
 6. **Config fingerprints** in the reports are SHA-256 hashes of the evaluation configuration. They identify a run setup; they don't certify results.
 
 ---

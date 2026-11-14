@@ -1,0 +1,56 @@
+{
+  "model": "checkpoints/sft_tiny_aya_merged",
+  "dataset_name": "unknown",
+  "output_dir": "./checkpoints/grpo_tiny_aya",
+  "agentic_mode": true,
+  "tools": [
+    "create_account",
+    "get_account_balance",
+    "check_compliance",
+    "post_journal_entry",
+    "audit_transaction"
+  ],
+  "train_size": 130,
+  "eval_size": 0,
+  "final_loss": -0.047901982069015504,
+  "total_steps": 30,
+  "training_history": [],
+  "metrics": {
+    "train_runtime": 4374.5223,
+    "train_samples_per_second": 0.027,
+    "train_steps_per_second": 0.007,
+    "total_flos": 0.0,
+    "train_loss": -0.047901982069015504,
+    "epoch": 0.46153846153846156
+  },
+  "config_kwargs": {
+    "model": "checkpoints/sft_tiny_aya_merged",
+    "train_dataset": "Dataset({\n    features: ['prompt', 'expected_terminal_state', 'num_tool_steps'],\n    num_rows: 130\n})",
+    "tools": [
+      "<function make_callable_ledger_tools.<locals>.create_account at 0x7cd0ef108e00>",
+      "<function make_callable_ledger_tools.<locals>.get_account_balance at 0x7cd0ef10b920>",
+      "<function make_callable_ledger_tools.<locals>.check_compliance at 0x7cd0ef109440>",
+      "<function make_callable_ledger_tools.<locals>.post_journal_entry at 0x7cd0ef1093a0>",
+      "<function make_callable_ledger_tools.<locals>.audit_transaction at 0x7cd0ef10bf60>"
+    ],
+    "reward_funcs": [
+      "<function agenttune_grpo_reward_fn at 0x7cd3ff4a6f20>"
+    ],
+    "output_dir": "./checkpoints/grpo_tiny_aya",
+    "max_steps": 30,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "learning_rate": 5e-06,
+    "num_generations": 2,
+    "max_steps_per_turn": 6,
+    "max_completion_length": 512,
+    "use_vllm": false,
+    "peft_config": {
+      "r": 16,
+      "lora_alpha": 32,
+      "target_modules": "all-linear",
+      "task_type": "CAUSAL_LM"
+    },
+    "report_to": "none"
+  }
+}

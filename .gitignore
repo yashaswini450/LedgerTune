@@ -6,6 +6,7 @@ venv/
 *.safetensors
 *.bin
 *.pt
+*.pth
 **/tokenizer.json
 
 

@@ -1,0 +1,11 @@
+{
+  "schema": "lexsi.provenance/1",
+  "library": "agenttune",
+  "version": "1.1.5",
+  "git_sha": null,
+  "created_at": "2026-11-14T13:14:36Z",
+  "base_model": "checkpoints/sft_tiny_aya_merged",
+  "method": "agentic.grpo",
+  "inputs": [],
+  "params": {}
+}
